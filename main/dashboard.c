@@ -166,7 +166,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,int32_t
                 xQueueOverwrite(q_mqtt_msgs, &msgs);
 
             } else if (strcmp(topic, "boat/messages/power") == 0) {
-                 // format:    {"powerMin":   35, "powerMax" : 45 } !!!!
+
                 cJSON *root = cJSON_Parse(payload);
                 if (root == NULL) {
                     ESP_LOGE("MQTT", "JSON parse failed");
@@ -177,19 +177,18 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,int32_t
                 cJSON *max = cJSON_GetObjectItem(root, "powerMax");
 
                 if (cJSON_IsNumber(min) && cJSON_IsNumber(max)) {
-                power_window_t pw = {
-                .range_min_kw = (float)min->valuedouble,
-                .range_max_kw = (float)max->valuedouble,
-                .active       = true
-                };
-                xQueueOverwrite(q_power_window, &pw);
-            }
-    }
+                    power_window_t pw = {
+                        .range_min_kw = (float)min->valuedouble,
+                        .range_max_kw = (float)max->valuedouble,
+                        .active       = true
+                    };
+                    xQueueOverwrite(q_power_window, &pw);
+                }
 
-    cJSON_Delete(root);
+                cJSON_Delete(root);  // ← mancava
             }
-            break;
-        }
+            break;  
+        }           
 
         case MQTT_EVENT_ERROR:
             ESP_LOGE("MQTT", "MQTT_EVENT_ERROR");
