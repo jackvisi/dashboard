@@ -1,0 +1,983 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "EVE.h"
+#include "EVE_commands.h"
+
+#include "mqtt_client.h"
+#include "esp_netif.h"
+#include "nvs_flash.h"
+#include "esp_event.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
+#include "esp_crt_bundle.h"
+
+#include "cJSON.h"
+
+//WIFI credentials
+#define WIFI_SSID "iPhone di Giacomo"
+#define WIFI_PASS "labarca123"
+static int maxretries = 5;
+
+// for the mqtt messages
+#define RX_TOPIC_MAX   128
+#define RX_PAYLOAD_MAX 256
+
+// for the button
+#define BTN_PIN GPIO_NUM_13
+static volatile uint8_t current_screen = 0;
+
+//mqtt global client
+static esp_mqtt_client_handle_t mqtt_client;
+
+static const char *LOG_TAG = "DASH";
+
+// macros used in the drawings
+#define PI              3.14159265f
+#define MAX_POWER_KW    60.0f
+#define MAX_RPM         3000.0f
+#define MAX_SPD         50.0f
+#define BAT_TEMP_WARN   55
+#define BAT_TEMP_ERROR  60
+#define HUM_WARN        75
+
+#define CX  400
+#define CY  220
+
+
+//---- Data Structure for the queues ----------------------
+
+typedef struct {
+    uint16_t rpm;
+    float    speed_kn;
+    float    power_kw;
+} motor_data_t;
+
+typedef struct {
+    uint8_t  soc;
+    float    voltage;
+    float    current;
+    uint8_t  temp_c;
+} battery_t;
+
+typedef struct {
+    battery_t bat[3];
+} battery_pack_t;
+
+typedef struct {
+    uint8_t humidity;
+} sensor_data_t;
+
+typedef struct {
+    float range_min_kw;
+    float range_max_kw;
+    bool  active;
+} power_window_t;
+
+#define MQTT_MSG_MAX_LEN  80
+#define MQTT_MSG_MAX_ROWS 3
+
+typedef struct {
+    char     lines[MQTT_MSG_MAX_ROWS][MQTT_MSG_MAX_LEN];
+    uint8_t  count;
+} mqtt_messages_t;
+
+//----- Code Start --------------------------------------------------
+
+static QueueHandle_t q_motor;
+static QueueHandle_t q_battery;
+static QueueHandle_t q_sensor;
+static QueueHandle_t q_power_window;
+static QueueHandle_t q_mqtt_msgs;
+
+//----- WiFi and MQTT initilization ---------------------------------
+static bool wifi_connected = false;
+
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED && maxretries > 0) {
+        wifi_connected = false;
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        wifi_connected = true;
+    }
+}
+
+static bool mqtt_connected = false;
+//mqtt events handler
+
+// message format: -powerMin, powerMax --> json, text-->string
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base,int32_t event_id, void *event_data)
+{
+    esp_mqtt_event_handle_t event = event_data;
+
+    switch (event->event_id) {
+
+        case MQTT_EVENT_CONNECTED:
+            esp_mqtt_client_subscribe(mqtt_client, "boat/messages/#", 1);
+            mqtt_connected = true;
+            break;
+
+        case MQTT_EVENT_DISCONNECTED:
+            mqtt_connected = false;
+            break;
+
+        case MQTT_EVENT_DATA: {
+            // copy topic
+            char topic[RX_TOPIC_MAX];
+            int tlen = (event->topic_len < (int)sizeof(topic) - 1) ? event->topic_len : (int)sizeof(topic) - 1;
+            memcpy(topic, event->topic, tlen);
+            topic[tlen] = '\0';
+
+            // copy payload
+            char payload[RX_PAYLOAD_MAX];
+            int plen = (event->data_len < (int)sizeof(payload) - 1) ? event->data_len : (int)sizeof(payload) - 1;
+            memcpy(payload, event->data, plen);
+            payload[plen] = '\0';
+
+            if (strcmp(topic, "boat/messages/text") == 0) {
+
+                // check the current status of the queue, and copy the queue in the msgs
+                mqtt_messages_t msgs;
+                if (xQueuePeek(q_mqtt_msgs, &msgs, 0) != pdTRUE) {
+                    memset(&msgs, 0, sizeof(msgs));
+                }
+
+                // shifting to make room for the new message
+                for (int i = MQTT_MSG_MAX_ROWS - 1; i > 0; i--) {
+                    strncpy(msgs.lines[i], msgs.lines[i - 1],MQTT_MSG_MAX_LEN - 1);
+                    msgs.lines[i][MQTT_MSG_MAX_LEN - 1] = '\0';
+                }
+
+                // new mesasge on top of the queue
+                strncpy(msgs.lines[0], payload, MQTT_MSG_MAX_LEN - 1);
+                msgs.lines[0][MQTT_MSG_MAX_LEN - 1] = '\0';
+                msgs.count = MQTT_MSG_MAX_ROWS;
+
+                // write into the quue 
+                xQueueOverwrite(q_mqtt_msgs, &msgs);
+
+            } else if (strcmp(topic, "boat/messages/power") == 0) {
+                 // format:    {"powerMin":   35, "powerMax" : 45 } !!!!
+                cJSON *root = cJSON_Parse(payload);
+                if (root == NULL) {
+                    ESP_LOGE("MQTT", "JSON parse failed");
+                    break;
+                }
+
+                cJSON *min = cJSON_GetObjectItem(root, "powerMin");
+                cJSON *max = cJSON_GetObjectItem(root, "powerMax");
+
+                if (cJSON_IsNumber(min) && cJSON_IsNumber(max)) {
+                power_window_t pw = {
+                .range_min_kw = (float)min->valuedouble,
+                .range_max_kw = (float)max->valuedouble,
+                .active       = true
+                };
+                xQueueOverwrite(q_power_window, &pw);
+            }
+    }
+
+    cJSON_Delete(root);
+            }
+            break;
+        }
+
+        case MQTT_EVENT_ERROR:
+            ESP_LOGE("MQTT", "MQTT_EVENT_ERROR");
+            break;
+
+        default:
+            break;
+    }
+}
+
+
+//initialization function for mqtt connection
+static void mqtt_app_start(void)
+{
+    esp_mqtt_client_config_t mqtt_cfg = {
+    .broker.address.uri = "mqtts://fbe643f0aede453b8a874f9eef1b696b.s1.eu.hivemq.cloud:8883",
+    .credentials.client_id = "ESP32Telemetry",
+    .credentials.username = "ffServer",
+    .credentials.authentication.password = "BoatServer25",
+    .broker.verification.use_global_ca_store = false,
+    .broker.verification.crt_bundle_attach = esp_crt_bundle_attach,
+    };
+
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(mqtt_client);
+}
+
+
+//initialization function for wi-fi
+void wifi_init_sta(void)
+{
+    // Start NVS
+    nvs_flash_init();
+    esp_netif_init();
+    esp_event_loop_create_default();
+
+    // Crea interfaccia Wi-Fi
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+    // Handler 
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,&wifi_event_handler, NULL, NULL);
+    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,&wifi_event_handler, NULL, NULL);
+
+    //SSID and password
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS
+        },
+    };
+
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+     esp_wifi_start();
+
+    //printf("Wi-Fi started, conntection to SSID: %s\n", WIFI_SSID);
+}
+
+//------ WIfi and MQTT status symbols on the screen ------------------
+
+static void draw_connectivity_status(bool wifi_ok, bool mqtt_ok)
+{
+    const int16_t BY = 460;   
+
+    // WiFi
+    EVE_color_rgb_burst(wifi_ok ? 0x00CC00UL : 0xFF2200UL);
+    EVE_cmd_text_burst(670, BY, 23, EVE_OPT_CENTER, "WiFi");
+
+    // separator 
+    EVE_color_rgb_burst(0x333333UL);
+    EVE_line_width_burst(1 * 16);
+    EVE_begin_burst(EVE_LINES);
+    EVE_vertex2f_burst(724 * 16, (BY - 8) * 16);
+    EVE_vertex2f_burst(724 * 16, (BY + 8) * 16);
+    EVE_end_burst();
+
+    // MQTT
+    EVE_color_rgb_burst(mqtt_ok ? 0x00CC00UL : 0xFF2200UL);
+    EVE_cmd_text_burst(750, BY, 23, EVE_OPT_CENTER, "MQTT");
+}
+
+// ----- Colours for the main values --------------------------------
+
+static uint32_t soc_color(uint8_t soc)
+{
+    if (soc <= 15U) return 0xFF2200UL;
+    if (soc <= 30U) return 0xFFAA00UL;
+    return 0x00CC00UL;
+}
+
+static uint32_t temp_color(uint8_t temp)
+{
+    if (temp >= BAT_TEMP_ERROR) return 0xFF2200UL;
+    if (temp >= BAT_TEMP_WARN)  return 0xFFAA00UL;
+    return 0x00AA00UL;
+}
+
+// ------- Draw Arc for the power gauge -----------------------------
+// radiants, start=150° sweep=240°
+
+static void draw_arc_segment(int16_t cx, int16_t cy, uint16_t radius, float val_start, float val_end, float val_max,uint32_t color, uint16_t thickness)//center (x, y) 
+{
+    float sweep     = 240.0f * PI / 180.0f;
+    float ang_start = 150.0f * PI / 180.0f;
+    float a0 = ang_start + sweep * (val_start / val_max);
+    float a1 = ang_start + sweep * (val_end   / val_max);
+
+    int steps = (int)((a1 - a0) / (PI / 180.0f));
+    if (steps < 2) steps = 2;
+
+    EVE_color_rgb_burst(color);
+    EVE_line_width_burst(thickness);
+    EVE_begin_burst(EVE_LINE_STRIP);
+    for (int i = 0; i <= steps; i++) {
+        float a = a0 + (a1 - a0) * i / (float)steps;
+        int16_t x = cx + (int16_t)((float)radius * cosf(a));
+        int16_t y = cy + (int16_t)((float)radius * sinf(a));
+        EVE_vertex2f_burst(x * 16, y * 16);
+    }
+    EVE_end_burst();
+}
+
+// ----- RPM bar ------------------------------------------------------
+
+static void draw_rpm_bar(uint16_t rpm, uint16_t max, const char * label)
+{
+    int16_t  bx = 0;
+    int16_t  by = 0;
+    uint16_t bw = 800;
+    uint16_t bh = 28;
+
+    // background
+    EVE_color_rgb_burst(0x1a1a1aUL);
+    EVE_begin_burst(EVE_RECTS);
+    EVE_vertex2f_burst(bx * 16,        by * 16);
+    EVE_vertex2f_burst((bx+bw) * 16,   (by+bh) * 16);
+    EVE_end_burst();
+
+    // colour zones: green 0-65%, yellow 65-85%, red 85-100%
+    uint16_t green_w  = (uint16_t)(bw * 65 / 100);
+    uint16_t yellow_w = (uint16_t)(bw * 85 / 100);
+
+    EVE_color_rgb_burst(0x006600UL);
+    EVE_begin_burst(EVE_RECTS);
+    EVE_vertex2f_burst(bx * 16,               by * 16);
+    EVE_vertex2f_burst((bx + green_w) * 16,   (by+bh) * 16);
+    EVE_end_burst();
+
+    EVE_color_rgb_burst(0x886600UL);
+    EVE_begin_burst(EVE_RECTS);
+    EVE_vertex2f_burst((bx + green_w) * 16,   by * 16);
+    EVE_vertex2f_burst((bx + yellow_w) * 16,  (by+bh) * 16);
+    EVE_end_burst();
+
+    EVE_color_rgb_burst(0x880000UL);
+    EVE_begin_burst(EVE_RECTS);
+    EVE_vertex2f_burst((bx + yellow_w) * 16,  by * 16);
+    EVE_vertex2f_burst((bx + bw) * 16,        (by+bh) * 16);
+    EVE_end_burst();
+
+    // dark mask to cover until the rpm value
+    if (rpm > max) rpm = max;
+    uint16_t fill_w = (uint16_t)((float)bw * rpm / max);
+    if (fill_w < bw) {
+        EVE_color_rgb_burst(0x0a0a0aUL);
+        EVE_begin_burst(EVE_RECTS);
+        EVE_vertex2f_burst((bx + fill_w) * 16,  by * 16);
+        EVE_vertex2f_burst((bx + bw) * 16,      (by+bh) * 16);
+        EVE_end_burst();
+    }
+
+    // valore RPM centrato
+    EVE_color_rgb_burst(0xffffffff);
+    EVE_cmd_number_burst(400, 14, 30, EVE_OPT_CENTER, (int32_t)rpm);
+    EVE_color_rgb_burst(0xaaaaaaUL);
+    EVE_cmd_text_burst(460, 14, 28, EVE_OPT_CENTERY, label);
+}
+
+// ----- Power Gauge --------------------------------------------------
+
+// function for drawing ticks on the arc
+static void draw_gauge_ticks_and_labels(uint16_t radius, float val_max, int tick_step, const power_window_t *pw)
+{
+    float sweep    = 240.0f * PI / 180.0f;
+    float ang_base = 150.0f * PI / 180.0f;
+    uint16_t rlab  = radius + 24;  // raggio etichette
+
+    int n_ticks = (int)(val_max / tick_step);
+
+    for (int i = 0; i <= n_ticks; i++) {
+        float val = i * tick_step;
+        float a   = ang_base + sweep * (val / val_max);
+
+        // tick lungo
+        int16_t x1 = CX + (int16_t)((radius - 8) * cosf(a));
+        int16_t y1 = CY + (int16_t)((radius - 8) * sinf(a));
+        int16_t x2 = CX + (int16_t)((radius + 8) * cosf(a));
+        int16_t y2 = CY + (int16_t)((radius + 8) * sinf(a));
+
+        EVE_color_rgb_burst(0x888888UL);
+        EVE_line_width_burst(2 * 16);
+        EVE_begin_burst(EVE_LINES);
+        EVE_vertex2f_burst(x1 * 16, y1 * 16);
+        EVE_vertex2f_burst(x2 * 16, y2 * 16);
+        EVE_end_burst();
+
+        // numero etichetta
+        int16_t lx = CX + (int16_t)(rlab * cosf(a));
+        int16_t ly = CY + (int16_t)(rlab * sinf(a));
+
+        // verde se dentro il range attivo, bianco altrimenti
+        bool in_range = (pw != NULL) && pw->active &&val >= pw->range_min_kw && val <= pw->range_max_kw;
+        EVE_color_rgb_burst(in_range ? 0x00DD00UL : 0xFFFFFFUL);
+        EVE_cmd_number_burst(lx, ly, 23, EVE_OPT_CENTER, (int32_t)val);
+    }
+
+    // tick corti intermedi
+    int minor_step = tick_step / 2;
+    if (minor_step > 0) {
+        int n_minor = (int)(val_max / minor_step);
+        for (int i = 0; i <= n_minor; i++) {
+            if (i % 2 == 0) continue;
+            float val = i * minor_step;
+            float a   = ang_base + sweep * (val / val_max);
+
+            int16_t x1 = CX + (int16_t)((radius - 4) * cosf(a));
+            int16_t y1 = CY + (int16_t)((radius - 4) * sinf(a));
+            int16_t x2 = CX + (int16_t)((radius + 4) * cosf(a));
+            int16_t y2 = CY + (int16_t)((radius + 4) * sinf(a));
+
+            EVE_color_rgb_burst(0x444444UL);
+            EVE_line_width_burst(1 * 16);
+            EVE_begin_burst(EVE_LINES);
+            EVE_vertex2f_burst(x1 * 16, y1 * 16);
+            EVE_vertex2f_burst(x2 * 16, y2 * 16);
+            EVE_end_burst();
+        }
+    }
+}
+
+// function for actually drawing the gauge for power/speed/rpm
+static void draw_gauge_generic(float power_kw, uint16_t max, const char* label, const power_window_t *pw)
+{
+    const uint16_t RAD = 120;
+    const uint16_t THK = 14 * 16;
+    const uint16_t RLAB = RAD + 28;
+
+    // borders of the range 
+    float sweep    = 240.0f * PI / 180.0f;
+    float ang_base = 150.0f * PI / 180.0f;
+
+    // main arc
+    draw_arc_segment(CX, CY, RAD, 0.0f, (float)max,(float)max, 0x222222UL, THK);
+
+    // green arc for target power range from mqtt, only if it is power
+    if (strcmp(label, "kW") == 0) {
+    
+        if (pw != NULL && pw->active) {
+            draw_arc_segment(CX, CY, RAD,pw->range_min_kw, pw->range_max_kw,MAX_POWER_KW, 0x007700UL, THK); //color green
+
+            for (int edge = 0; edge < 2; edge++) {
+                float val = (edge == 0) ? pw->range_min_kw : pw->range_max_kw;
+                float a   = ang_base + sweep * (val / MAX_POWER_KW);
+                int16_t x1 = CX + (int16_t)((RAD - 10) * cosf(a));
+                int16_t y1 = CY + (int16_t)((RAD - 10) * sinf(a));
+                int16_t x2 = CX + (int16_t)((RAD + 10) * cosf(a));
+                int16_t y2 = CY + (int16_t)((RAD + 10) * sinf(a));
+                EVE_color_rgb_burst(0xFFFFFFUL);
+                EVE_line_width_burst(2 * 16);
+                EVE_begin_burst(EVE_LINES);
+                EVE_vertex2f_burst(x1 * 16, y1 * 16);
+                EVE_vertex2f_burst(x2 * 16, y2 * 16);
+                EVE_end_burst();
+            }
+            // label range
+            char rng[24];
+            snprintf(rng, sizeof(rng), "%.0f - %.0f kW", (double)pw->range_min_kw, (double)pw->range_max_kw);
+            EVE_color_rgb_burst(0x00AA00UL);
+            EVE_cmd_text_burst(CX, CY + 85, 23, EVE_OPT_CENTER, rng);
+        }
+        draw_gauge_ticks_and_labels(RAD, MAX_POWER_KW, 10, pw);
+
+    }else if (strcmp(label, "knots") == 0){
+        draw_gauge_ticks_and_labels(RAD, MAX_SPD, 10, NULL);
+    }else if(strcmp(label, "rpm") == 0){
+        draw_gauge_ticks_and_labels(RAD, MAX_RPM, 500, NULL);
+    }
+
+    // needle
+    float ang_needle = ang_base + sweep * (power_kw / (float)max);
+    int16_t nx = CX + (int16_t)((RAD - 10) * cosf(ang_needle));
+    int16_t ny = CY + (int16_t)((RAD - 10) * sinf(ang_needle));
+    EVE_color_rgb_burst(0xFFFFFFUL);
+    EVE_line_width_burst(3 * 16);
+    EVE_begin_burst(EVE_LINES);
+    EVE_vertex2f_burst(CX * 16, CY * 16);
+    EVE_vertex2f_burst(nx * 16, ny * 16);
+    EVE_end_burst();
+
+    // center circle
+    EVE_color_rgb_burst(0x444444UL);
+    EVE_point_size_burst(10 * 16);
+    EVE_begin_burst(EVE_POINTS);
+    EVE_vertex2f_burst(CX * 16, CY * 16);
+    EVE_end_burst();
+
+    // power value 
+    EVE_color_rgb_burst(0xFFFFFFUL);
+    char pw_str[12];
+    snprintf(pw_str, sizeof(pw_str), "%.1f", (double)power_kw);
+    EVE_cmd_text_burst(CX, CY + 40, 31, EVE_OPT_CENTER, pw_str);
+    EVE_color_rgb_burst(0x888888UL);
+    EVE_cmd_text_burst(CX, CY + 69, 26, EVE_OPT_CENTER, label);
+
+}
+
+// ------- Speed -----------------------------------------------
+
+static void draw_speed(float speed_kn, const char * title, const char * label)
+{
+    EVE_cmd_romfont_burst(1U, 33U);
+    // box speed: x=580, y=36, w=210, h=170
+    EVE_color_rgb_burst(0x111111UL);
+    EVE_begin_burst(EVE_RECTS);
+    EVE_vertex2f_burst(580 * 16,  36 * 16);
+    EVE_vertex2f_burst(790 * 16, 170 * 16);
+    EVE_end_burst();
+
+    EVE_color_rgb_burst(0x555555UL);//grey
+    EVE_cmd_text_burst(685, 52, 25, EVE_OPT_CENTER, title);
+
+    EVE_color_rgb_burst(0xFFFFFFUL); // white
+    char spd[8];
+    snprintf(spd, sizeof(spd), "%.1f", (double)speed_kn);
+    EVE_cmd_text_burst(685, 114, 1, EVE_OPT_CENTER, spd);
+
+    EVE_color_rgb_burst(0x888888UL); // grey
+    EVE_cmd_text_burst(685, 152, 26, EVE_OPT_CENTER, label);
+}
+
+// ----------- Batteries ----------------------------------------
+
+static void draw_battery_box(int16_t x, int16_t y, uint16_t w, uint16_t h,uint8_t idx, const battery_t *bat)
+{
+    bool alarm = bat->temp_c >= BAT_TEMP_ERROR; //check for the alarm
+
+    // borders of the box
+    EVE_color_rgb_burst(alarm ? 0xFF2200UL : 0x333333UL);
+    EVE_line_width_burst(1 * 16);
+    EVE_begin_burst(EVE_RECTS);
+    EVE_vertex2f_burst(x * 16,         y * 16);
+    EVE_vertex2f_burst((x + w) * 16,   (y + h) * 16);
+    EVE_end_burst();
+
+    // background 
+    EVE_color_rgb_burst(alarm ? 0x1a0808UL : 0x111111UL);
+    EVE_begin_burst(EVE_RECTS);
+    EVE_vertex2f_burst((x + 1) * 16,       (y + 1) * 16);
+    EVE_vertex2f_burst((x + w - 1) * 16,   (y + h - 1) * 16);
+    EVE_end_burst();
+
+    // row 1: label + SOC (y + 20)
+    char lbl[10];
+    if (idx == 2){
+        snprintf(lbl, sizeof(lbl), "LVB1");
+    }else{
+        snprintf(lbl, sizeof(lbl), "B%d", idx + 1);
+    }
+    //EVE_color_rgb_burst(alarm ? 0xFF4400UL : 0x555555UL); 0xFFFFFFUL
+    EVE_color_rgb_burst(alarm ? 0xFF4400UL : 0xFFFFFFUL);
+    EVE_cmd_text_burst(x + 8, y + 20, 25, EVE_OPT_CENTERY, lbl);
+
+    char soc_str[8];
+    snprintf(soc_str, sizeof(soc_str), "%d%%", bat->soc);
+    EVE_color_rgb_burst(soc_color(bat->soc));
+    EVE_cmd_text_burst(x + w - 8, y + 20, 25, EVE_OPT_RIGHTX | EVE_OPT_CENTERY, soc_str);
+
+    // row 2: SOC bar (y + 36 -- y + 56)
+    int16_t  bx = x + 8;
+    int16_t  by = y + 36;
+    uint16_t bw = w - 16;
+    uint16_t bh = 20;
+    uint16_t fw = (uint16_t)((float)bw * bat->soc / 100.0f);
+
+    EVE_color_rgb_burst(0x1a1a1aUL);
+    EVE_begin_burst(EVE_RECTS);
+    EVE_vertex2f_burst(bx * 16,          by * 16);
+    EVE_vertex2f_burst((bx + bw) * 16,   (by + bh) * 16);
+    EVE_end_burst();
+
+    if (fw > 0U) {
+        EVE_color_rgb_burst(soc_color(bat->soc));
+        EVE_begin_burst(EVE_RECTS);
+        EVE_vertex2f_burst(bx * 16,          by * 16);
+        EVE_vertex2f_burst((bx + fw) * 16,   (by + bh) * 16);
+        EVE_end_burst();
+    }
+
+    // row 3: voltage and temperature (y + 75)
+    char volt_str[10];
+    snprintf(volt_str, sizeof(volt_str), "%.1fV", (double)bat->voltage);
+    EVE_color_rgb_burst(0x555555UL);
+    EVE_cmd_text_burst(x + 8, y + 70, 24, EVE_OPT_CENTERY, volt_str);
+
+    char temp_str[8];
+    snprintf(temp_str, sizeof(temp_str), "%dC", bat->temp_c);
+    EVE_color_rgb_burst(temp_color(bat->temp_c));
+    EVE_cmd_text_burst(x + w - 8, y + 70, 24, EVE_OPT_RIGHTX | EVE_OPT_CENTERY, temp_str);
+}
+
+static void draw_batteries(const battery_pack_t *pack)
+{
+    // two batteries: x=580, y=178, w=210
+    draw_battery_box(580, 178, 210, 86, 0, &pack->bat[0]);
+    draw_battery_box(580, 268, 210, 86, 1, &pack->bat[1]);
+    draw_battery_box(580, 358, 210, 86, 2, &pack->bat[2]);
+
+    /* average SOC
+    uint8_t avg = (pack->bat[0].soc + pack->bat[1].soc) / 2U;
+    EVE_color_rgb_burst(0xFFFFFFUL);
+    EVE_cmd_text_burst(580 + 8, 410, 25, EVE_OPT_CENTERY, "Average:");
+    char avg_str[8];
+    snprintf(avg_str, sizeof(avg_str), "%d%%", (int)avg);
+    EVE_color_rgb_burst(soc_color(avg));
+    EVE_cmd_text_burst(790 - 8, 410, 29,EVE_OPT_RIGHTX | EVE_OPT_CENTERY, avg_str); */
+}
+
+// ------ Alarms -----------------------------------------------------------------
+
+static void draw_warnings(const battery_pack_t *pack, const sensor_data_t *sens)
+{
+    const int16_t  WX = 8;
+    const int16_t  WY = 36;
+    const uint16_t WW = 200;
+    const uint16_t WH = 300;
+
+    // outer box
+    EVE_color_rgb_burst(0x111111UL);
+    EVE_begin_burst(EVE_RECTS);
+    EVE_vertex2f_burst(WX * 16,          WY * 16);
+    EVE_vertex2f_burst((WX + WW) * 16,   (WY + WH) * 16);
+    EVE_end_burst();
+
+    // title
+    EVE_color_rgb_burst(0x888888UL);
+    EVE_cmd_text_burst(WX + WW / 2, WY + 20, 28, EVE_OPT_CENTER, "Alarms");
+
+    // line to separate the title
+    EVE_color_rgb_burst(0xFFFFFFUL);
+    EVE_line_width_burst(1 * 16);
+    EVE_begin_burst(EVE_LINES);
+    EVE_vertex2f_burst((WX + 8) * 16,          (WY + 34) * 16);
+    EVE_vertex2f_burst((WX + WW - 8) * 16,     (WY + 34) * 16);
+    EVE_end_burst();
+
+    // variable for the three alarms
+    bool  active[4];
+    uint32_t color[4];
+    char  title[4][12];
+    char  detail[4][20];
+
+    // TEMP B1
+    active[0] = pack->bat[0].temp_c >= BAT_TEMP_WARN;
+    color[0]  = active[0] ? 0xFF2200UL : 0x444444UL; // red or grey
+    snprintf(title[0],  sizeof(title[0]),  "TEMP B1");
+    snprintf(detail[0], sizeof(detail[0]), "%d C", (int)pack->bat[0].temp_c);
+
+    // TEMP B2
+    active[1] = pack->bat[1].temp_c >= BAT_TEMP_WARN;
+    color[1]  = active[1] ? 0xFF2200UL : 0x444444UL;
+    snprintf(title[1],  sizeof(title[1]),  "TEMP B2");
+    snprintf(detail[1], sizeof(detail[1]), "%d C", (int)pack->bat[1].temp_c);
+
+    // TEMP LVB1
+    active[2] = pack->bat[2].temp_c >= BAT_TEMP_WARN;
+    color[2]  = active[2] ? 0xFF2200UL : 0x444444UL;
+    snprintf(title[2],  sizeof(title[2]),  "TEMP LVB1");
+    snprintf(detail[2], sizeof(detail[2]), "%d C", (int)pack->bat[2].temp_c);
+
+    // HUM
+    active[3] = sens->humidity >= HUM_WARN;
+    color[3]  = active[3] ? 0xFFAA00UL : 0x444444UL; // yellow or grey
+    snprintf(title[3],  sizeof(title[3]),  "HUM");
+    snprintf(detail[3], sizeof(detail[3]), "%d %%", (int)sens->humidity);
+
+    // draw the 3 lines 
+    int16_t wy = WY + 44;
+    for (int i = 0; i < 4; i++) {
+
+        // background line
+        EVE_color_rgb_burst(active[i] ? 0x1a0a0aUL : 0x0f0f0fUL);
+        EVE_begin_burst(EVE_RECTS);
+        EVE_vertex2f_burst((WX + 8) * 16,          wy * 16);
+        EVE_vertex2f_burst((WX + WW - 8) * 16,     (wy + 53) * 16);
+        EVE_end_burst();
+
+        // triangle
+        EVE_color_rgb_burst(color[i]);
+        EVE_line_width_burst(2 * 16);
+        EVE_begin_burst(EVE_LINE_STRIP);
+        EVE_vertex2f_burst((WX + 14) * 16,  (wy + 46) * 16);
+        EVE_vertex2f_burst((WX + 26) * 16,  (wy + 18) * 16);
+        EVE_vertex2f_burst((WX + 38) * 16,  (wy + 46) * 16);
+        EVE_vertex2f_burst((WX + 14) * 16,  (wy + 46) * 16);
+        EVE_end_burst();
+
+        // '!' inside the triangle 
+        if (active[i]) {
+            EVE_color_rgb_burst(color[i]);
+            EVE_cmd_text_burst(WX + 26, wy + 36, 22, EVE_OPT_CENTER, "!");
+        }
+
+        // title 
+        EVE_color_rgb_burst(color[i]);
+        EVE_cmd_text_burst(WX + 46, wy + 18, 27, 0, title[i]);
+
+        // details 
+        EVE_color_rgb_burst(active[i] ? 0xAAAAAAUL : 0x333333UL);
+        EVE_cmd_text_burst(WX + 46, wy + 38, 26, 0, detail[i]);
+
+        wy += 64;  // 56 high + 8 gap
+    }
+}
+
+// ------ MQTT messages ------------------------------------------------------
+
+static void draw_mqtt_bar(const mqtt_messages_t *msgs)
+{
+    const int16_t  MX = 0;
+    const int16_t  MY = 342;
+    const uint16_t MW = 570;
+    const uint16_t MH = 148;
+
+    EVE_color_rgb_burst(0x0d0d0dUL);
+    EVE_begin_burst(EVE_RECTS);
+    EVE_vertex2f_burst(MX * 16,        MY * 16);
+    EVE_vertex2f_burst((MX+MW) * 16,   (MY+MH) * 16);
+    EVE_end_burst();
+
+    EVE_color_rgb_burst(0x444444UL);
+
+    for (int i = 0; i < msgs->count && i < MQTT_MSG_MAX_ROWS; i++) {
+        if (msgs->lines[i][0] == '\0') continue;
+
+        uint32_t col = (i == 0) ? 0xCCCCCCUL : 0x555555UL;
+        EVE_color_rgb_burst(col);
+        EVE_cmd_text_burst(MX + 10,MY + 28 + i * 42,25, EVE_OPT_CENTERY,msgs->lines[i]);
+    }
+}
+// ------ Fake MQTT ----------
+static void fake_mqtt_task(void *pvParameters)
+{
+    // range value that change every 10 sec 
+    const float ranges[][2] = {
+        {10.0f, 25.0f},
+        {20.0f, 35.0f},
+        {30.0f, 45.0f},
+        {15.0f, 40.0f},
+    };
+    const char *messages[] = {
+        "Good job!!",
+        "Keep power steady",
+        "Last Lap Time: 22.01s",
+        "good, keep going!",
+    };
+
+    int idx = 0;
+    const int n = 4;
+
+    while (1) {
+        // write the value on the queue
+        power_window_t pw = {
+            .range_min_kw = ranges[idx][0],
+            .range_max_kw = ranges[idx][1],
+            .active       = true
+        };
+        xQueueOverwrite(q_power_window, &pw);
+        ESP_LOGI(LOG_TAG, "MQTT power window: %.0f -> %.0f kW",(double)pw.range_min_kw, (double)pw.range_max_kw);
+
+        // write new messages 
+        mqtt_messages_t msgs;
+
+        // check the status of the queue
+        if (xQueueReceive(q_mqtt_msgs, &msgs, 0) != pdTRUE) {
+            memset(&msgs, 0, sizeof(msgs));
+        }
+
+        // shift the message of one position 
+        for (int i = MQTT_MSG_MAX_ROWS - 1; i > 0; i--) {
+            strncpy(msgs.lines[i], msgs.lines[i - 1],MQTT_MSG_MAX_LEN - 1);
+            msgs.lines[i][MQTT_MSG_MAX_LEN - 1] = '\0';
+        }
+
+        // new message on top of the queue 
+        strncpy(msgs.lines[0], messages[idx], MQTT_MSG_MAX_LEN - 1);
+        msgs.lines[0][MQTT_MSG_MAX_LEN - 1] = '\0';
+        msgs.count = MQTT_MSG_MAX_ROWS;
+
+        ESP_LOGI("MQTT", "count=%d", msgs.count);
+        ESP_LOGI("MQTT", "lines[0]=%s", msgs.lines[0]);
+        ESP_LOGI("MQTT", "lines[1]=%s", msgs.lines[1]);
+        ESP_LOGI("MQTT", "lines[2]=%s", msgs.lines[2]);
+        xQueueOverwrite(q_mqtt_msgs, &msgs);
+        ESP_LOGI(LOG_TAG, "MQTT msg: %s", messages[idx]);
+
+        idx = (idx + 1) % n;
+
+        vTaskDelay(pdMS_TO_TICKS(10000)); // 10 secondi
+    }
+}
+
+
+// ------ Fake Can Task -------------------------------------------
+
+static void fake_can_task(void *pvParameters)
+{
+    motor_data_t   motor  = {0};
+    battery_pack_t pack   = {0};
+    sensor_data_t  sensor = {0};
+
+    pack.bat[0].soc     = 85U;
+    pack.bat[0].voltage = 48.1f;
+    pack.bat[0].current = 8.2f;
+    pack.bat[0].temp_c  = 38U;
+
+    pack.bat[1].soc     = 71U;
+    pack.bat[1].voltage = 47.8f;
+    pack.bat[1].current = 8.4f;
+    pack.bat[1].temp_c  = 62U;
+
+    pack.bat[2].soc     = 71U;
+    pack.bat[2].voltage = 12.1f;
+    pack.bat[2].current = 8.4f;
+    pack.bat[2].temp_c  = 62U;
+
+    sensor.humidity = 82U;
+
+    int dir = 1;
+
+    while (1) {
+        motor.rpm      += dir * 30;
+        motor.speed_kn  = motor.rpm / 100.0f;
+        motor.power_kw  = motor.rpm / 50.0f;
+
+        if (motor.rpm >= MAX_RPM) dir = -1;
+        if (motor.rpm == 0)       dir =  1;
+
+        xQueueOverwrite(q_motor,   &motor);
+        xQueueOverwrite(q_battery, &pack);
+        xQueueOverwrite(q_sensor,  &sensor);
+
+        vTaskDelay(pdMS_TO_TICKS(80));
+    }
+}
+
+// -------- Button Task ---------------------------------------------------
+static void button_task(void *pvParameters)
+{
+    bool btn_prev = true;
+
+    while (1) {
+        bool btn = gpio_get_level(BTN_PIN);
+
+        if (btn_prev == true && btn == false) {
+            current_screen = (current_screen + 1) % 3;
+        }
+
+        btn_prev = btn;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+// ------ Display Task ----------------------------------------------------
+
+static void eve_task(void *pvParameters)
+{
+    EVE_init_spi();
+
+    uint8_t ret = EVE_init();
+    if (ret != 0U) {
+        ESP_LOGE(LOG_TAG, "EVE_init fallito ret=%d", ret);
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(LOG_TAG, "FT812 ok");
+
+    EVE_memWrite16(REG_PWM_HZ,   1000U);
+    EVE_memWrite8(REG_PWM_DUTY,  96U);
+
+    motor_data_t    motor    = {0};
+    battery_pack_t  pack     = {0};
+    sensor_data_t   sensor   = {0};
+    power_window_t  pw       = {0};
+    mqtt_messages_t msgs     = {0};
+
+    // initial message
+    strncpy(msgs.lines[0], "Waiting for messages...",
+            MQTT_MSG_MAX_LEN - 1);
+    msgs.count = MQTT_MSG_MAX_ROWS;
+
+    while (1) {
+        xQueuePeek(q_motor,         &motor,  0);
+        xQueuePeek(q_battery,       &pack,   0);
+        xQueuePeek(q_sensor,        &sensor, 0);
+        xQueuePeek(q_power_window,  &pw,     0);
+
+        mqtt_messages_t new_msgs;
+        if (xQueuePeek(q_mqtt_msgs, &new_msgs, 0) == pdTRUE) {
+            msgs = new_msgs;
+        }
+        //int64_t t0 = esp_timer_get_time();
+
+        EVE_start_cmd_burst();
+        EVE_cmd_dlstart_burst();
+        EVE_clear_color_rgb_burst(0x0a0a0aUL);
+        EVE_clear_burst(1U, 1U, 1U);
+        draw_warnings(&pack, &sensor);
+        switch (current_screen) {
+            case 0:
+                draw_rpm_bar(motor.rpm, MAX_RPM, "rpm");
+                draw_gauge_generic(motor.power_kw, MAX_POWER_KW, "kW", &pw);
+                draw_speed(motor.speed_kn, "Speed","knots");
+                break;
+            case 1:
+                draw_rpm_bar(motor.rpm, MAX_RPM, "rpm");
+                draw_gauge_generic(motor.speed_kn, MAX_SPD, "knots", NULL);
+                draw_speed(motor.power_kw, "Power","kW");
+                break;
+            case 2:
+                draw_rpm_bar(motor.power_kw, MAX_POWER_KW, "kW");
+                draw_gauge_generic(motor.rpm, MAX_RPM, "rpm", NULL);
+                draw_speed(motor.speed_kn, "Speed","knots");
+                break;
+        }
+        draw_batteries(&pack);
+        draw_mqtt_bar(&msgs);
+        draw_connectivity_status(wifi_connected, mqtt_connected);
+
+        EVE_display_burst();
+        EVE_cmd_swap_burst();
+        EVE_end_cmd_burst();
+        EVE_execute_cmd();
+        //int64_t t1 = esp_timer_get_time();
+        //ESP_LOGI(LOG_TAG, "frame: %lld us", t1 - t0);
+
+        vTaskDelay(pdMS_TO_TICKS(33));
+    }
+}
+
+
+
+// ------ MAIN ------------------------------------------
+
+void app_main(void)
+{
+    // button configurations
+    gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << BTN_PIN),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE
+    };
+
+    gpio_config(&cfg);
+
+    // wifi and mqtt initialization
+    wifi_init_sta(); // connection to wifi
+    mqtt_app_start(); // mqtt connection
+
+    // queues initilization
+    q_motor         = xQueueCreate(1, sizeof(motor_data_t));
+    q_battery       = xQueueCreate(1, sizeof(battery_pack_t));
+    q_sensor        = xQueueCreate(1, sizeof(sensor_data_t));
+    q_power_window  = xQueueCreate(1, sizeof(power_window_t));
+    q_mqtt_msgs     = xQueueCreate(1, sizeof(mqtt_messages_t));
+
+    // initial values in the queue
+    motor_data_t   m = {0};   xQueueSend(q_motor,        &m, 0);
+    battery_pack_t b = {0};   xQueueSend(q_battery,      &b, 0);
+    sensor_data_t  s = {0};   xQueueSend(q_sensor,       &s, 0);
+    power_window_t p = {0};   xQueueSend(q_power_window, &p, 0);
+
+    xTaskCreate(fake_can_task, "can",     3072, NULL, 5, NULL);
+    xTaskCreatePinnedToCore(eve_task, "display", 6144, NULL, 4, NULL, 1);
+    xTaskCreate(fake_mqtt_task, "fake_mqtt", 4096, NULL, 3, NULL);
+    xTaskCreatePinnedToCore(button_task, "button", 2048, NULL, 3, NULL, 1);
+}
