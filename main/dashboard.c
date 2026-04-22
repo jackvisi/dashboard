@@ -145,25 +145,35 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,int32_t
 
             if (strcmp(topic, "boat/messages/text") == 0) {
 
-                // check the current status of the queue, and copy the queue in the msgs
-                mqtt_messages_t msgs;
-                if (xQueuePeek(q_mqtt_msgs, &msgs, 0) != pdTRUE) {
+                cJSON *root = cJSON_Parse(payload);
+                if (root == NULL) {
+                    ESP_LOGE("MQTT", "JSON parse failed");
+                    break;
+                }
+
+                cJSON *msg_item = cJSON_GetObjectItem(root, "message");
+                if (cJSON_IsString(msg_item) && msg_item->valuestring != NULL) {
+
+                    // check the current status of the queue
+                    mqtt_messages_t msgs;
+                    if (xQueuePeek(q_mqtt_msgs, &msgs, 0) != pdTRUE) {
                     memset(&msgs, 0, sizeof(msgs));
+                    }
+
+                    // shift to make room for the new message
+                    for (int i = MQTT_MSG_MAX_ROWS - 1; i > 0; i--) {
+                        strncpy(msgs.lines[i], msgs.lines[i - 1], MQTT_MSG_MAX_LEN - 1);
+                        msgs.lines[i][MQTT_MSG_MAX_LEN - 1] = '\0';
+                    }
+
+                    // new message on top
+                    strncpy(msgs.lines[0], msg_item->valuestring, MQTT_MSG_MAX_LEN - 1);
+                    msgs.lines[0][MQTT_MSG_MAX_LEN - 1] = '\0';
+                    if (msgs.count < MQTT_MSG_MAX_ROWS) msgs.count++;
+
+                    xQueueOverwrite(q_mqtt_msgs, &msgs);
                 }
-
-                // shifting to make room for the new message
-                for (int i = MQTT_MSG_MAX_ROWS - 1; i > 0; i--) {
-                    strncpy(msgs.lines[i], msgs.lines[i - 1],MQTT_MSG_MAX_LEN - 1);
-                    msgs.lines[i][MQTT_MSG_MAX_LEN - 1] = '\0';
-                }
-
-                // new mesasge on top of the queue
-                strncpy(msgs.lines[0], payload, MQTT_MSG_MAX_LEN - 1);
-                msgs.lines[0][MQTT_MSG_MAX_LEN - 1] = '\0';
-                msgs.count = MQTT_MSG_MAX_ROWS;
-
-                // write into the quue 
-                xQueueOverwrite(q_mqtt_msgs, &msgs);
+                cJSON_Delete(root);
 
             } else if (strcmp(topic, "boat/messages/power") == 0) {
 
