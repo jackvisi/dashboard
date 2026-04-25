@@ -122,7 +122,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,int32_t
     switch (event->event_id) {
 
         case MQTT_EVENT_CONNECTED:
-            esp_mqtt_client_subscribe(mqtt_client, "boat/messages/#", 1);
+            esp_mqtt_client_subscribe(mqtt_client, "boat/message/#", 1);
             mqtt_connected = true;
             break;
 
@@ -143,39 +143,28 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,int32_t
             memcpy(payload, event->data, plen);
             payload[plen] = '\0';
 
-            if (strcmp(topic, "boat/messages/text") == 0) {
+            if (strcmp(topic, "boat/message/text") == 0) {
 
-                cJSON *root = cJSON_Parse(payload);
-                if (root == NULL) {
-                    ESP_LOGE("MQTT", "JSON parse failed");
-                    break;
+                // check the current status of the queue
+                mqtt_messages_t msgs;
+                if (xQueuePeek(q_mqtt_msgs, &msgs, 0) != pdTRUE) {
+                memset(&msgs, 0, sizeof(msgs));
                 }
 
-                cJSON *msg_item = cJSON_GetObjectItem(root, "message");
-                if (cJSON_IsString(msg_item) && msg_item->valuestring != NULL) {
-
-                    // check the current status of the queue
-                    mqtt_messages_t msgs;
-                    if (xQueuePeek(q_mqtt_msgs, &msgs, 0) != pdTRUE) {
-                    memset(&msgs, 0, sizeof(msgs));
-                    }
-
-                    // shift to make room for the new message
-                    for (int i = MQTT_MSG_MAX_ROWS - 1; i > 0; i--) {
-                        strncpy(msgs.lines[i], msgs.lines[i - 1], MQTT_MSG_MAX_LEN - 1);
-                        msgs.lines[i][MQTT_MSG_MAX_LEN - 1] = '\0';
-                    }
-
-                    // new message on top
-                    strncpy(msgs.lines[0], msg_item->valuestring, MQTT_MSG_MAX_LEN - 1);
-                    msgs.lines[0][MQTT_MSG_MAX_LEN - 1] = '\0';
-                    if (msgs.count < MQTT_MSG_MAX_ROWS) msgs.count++;
-
-                    xQueueOverwrite(q_mqtt_msgs, &msgs);
+                // shift to make room for the new message
+                for (int i = MQTT_MSG_MAX_ROWS - 1; i > 0; i--) {
+                    strncpy(msgs.lines[i], msgs.lines[i - 1], MQTT_MSG_MAX_LEN - 1);
+                    msgs.lines[i][MQTT_MSG_MAX_LEN - 1] = '\0';
                 }
-                cJSON_Delete(root);
 
-            } else if (strcmp(topic, "boat/messages/power") == 0) {
+                // new message on top
+                strncpy(msgs.lines[0], payload, MQTT_MSG_MAX_LEN - 1);
+                msgs.lines[0][MQTT_MSG_MAX_LEN - 1] = '\0';
+                if (msgs.count < MQTT_MSG_MAX_ROWS) msgs.count++;
+
+                xQueueOverwrite(q_mqtt_msgs, &msgs);
+                
+            } else if (strcmp(topic, "boat/message/power") == 0) {
 
                 cJSON *root = cJSON_Parse(payload);
                 if (root == NULL) {
@@ -236,7 +225,7 @@ void wifi_init_sta(void)
     esp_netif_init();
     esp_event_loop_create_default();
 
-    // Crea interfaccia Wi-Fi
+    
     esp_netif_create_default_wifi_sta();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&cfg);
