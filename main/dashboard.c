@@ -23,6 +23,7 @@
 #include "batteries_gps_motor_2.h"  // FF DTU Boat CAN Library
 #include "nma2000_motor.h"
 #include "motor_estimated.h"  // NMA2000 Motor CAN Libraty calibrated
+#include "driver/twai.h"
 // can pins
 #define CAN_TX  GPIO_NUM_21
 #define CAN_RX  GPIO_NUM_22
