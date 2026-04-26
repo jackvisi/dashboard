@@ -20,6 +20,13 @@
 
 #include "cJSON.h"
 
+#include "batteries_gps_motor_2.h"  // FF DTU Boat CAN Library
+#include "nma2000_motor.h"
+#include "motor_estimated.h"  // NMA2000 Motor CAN Libraty calibrated
+// can pins
+#define CAN_TX  GPIO_NUM_21
+#define CAN_RX  GPIO_NUM_22
+
 //WIFI credentials
 #define WIFI_SSID "iPhone di Giacomo"
 #define WIFI_PASS "labarca123"
@@ -863,6 +870,153 @@ static void button_task(void *pvParameters)
     }
 }
 
+// ---------CAN Receiver Task ---------------------------------------------
+void can_receiver_task(void *pvParameters)
+{
+    while (1) {
+        twai_message_t rxMessage;
+        while (twai_receive(&rxMessage, pdMS_TO_TICKS(10)) == ESP_OK) {
+
+            switch (rxMessage.identifier) {
+
+                case 0x15F40200: {  // Motor RPM + Power
+                    struct motor_estimated_motor_estimated_t msg;
+                    motor_estimated_motor_estimated_unpack(&msg,
+                        rxMessage.data, rxMessage.data_length_code);
+
+                    motor_data_t motor;
+                    if (xQueuePeek(q_motor, &motor, 0) != pdTRUE) {
+                        memset(&motor, 0, sizeof(motor));
+                    }
+                    motor.rpm      = (uint16_t)motor_estimated_motor_estimated_rpm_estimated_decode(msg.rpm_estimated);
+                    motor.power_kw = motor_estimated_motor_estimated_power_estimated_decode(msg.power_estimated);
+                    xQueueOverwrite(q_motor, &motor);
+                    break;
+                }
+
+                case 0x7: {  // GPS Speed
+                    struct batteries_gps_motor_2_gnss_speed_t msg;
+                    batteries_gps_motor_2_gnss_speed_unpack(&msg,
+                        rxMessage.data, rxMessage.data_length_code);
+
+                    motor_data_t motor;
+                    if (xQueuePeek(q_motor, &motor, 0) != pdTRUE) {
+                        memset(&motor, 0, sizeof(motor));
+                    }
+                    motor.speed_kn = batteries_gps_motor_2_gnss_speed_speed_decode(msg.speed);
+                    xQueueOverwrite(q_motor, &motor);
+                    break;
+                }
+
+                case 0x359: {  // Battery 1 voltage, current, temp
+                    struct batteries_gps_motor_2_battery_volt_curr_temp_1_t msg;
+                    batteries_gps_motor_2_battery_volt_curr_temp_1_unpack(&msg,
+                        rxMessage.data, rxMessage.data_length_code);
+
+                    battery_pack_t pack;
+                    if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
+                        memset(&pack, 0, sizeof(pack));
+                    }
+                    pack.bat[0].voltage = batteries_gps_motor_2_battery_volt_curr_temp_1_battery_voltage_1_decode(msg.battery_voltage_1);
+                    pack.bat[0].current = batteries_gps_motor_2_battery_volt_curr_temp_1_battery_current_1_decode(msg.battery_current_1);
+                    pack.bat[0].temp_c  = (uint8_t)batteries_gps_motor_2_battery_volt_curr_temp_1_battery_temp_1_decode(msg.battery_temp_1);
+                    xQueueOverwrite(q_battery, &pack);
+                    break;
+                }
+
+                case 0x360: {  // Battery 2 voltage, current, temp
+                    struct batteries_gps_motor_2_battery_volt_curr_temp_2_t msg;
+                    batteries_gps_motor_2_battery_volt_curr_temp_2_unpack(&msg,
+                        rxMessage.data, rxMessage.data_length_code);
+
+                    battery_pack_t pack;
+                    if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
+                        memset(&pack, 0, sizeof(pack));
+                    }
+                    pack.bat[1].voltage = batteries_gps_motor_2_battery_volt_curr_temp_2_battery_voltage_2_decode(msg.battery_voltage_2);
+                    pack.bat[1].current = batteries_gps_motor_2_battery_volt_curr_temp_2_battery_current_2_decode(msg.battery_current_2);
+                    pack.bat[1].temp_c  = (uint8_t)batteries_gps_motor_2_battery_volt_curr_temp_2_battery_temp_2_decode(msg.battery_temp_2);
+                    xQueueOverwrite(q_battery, &pack);
+                    break;
+                }
+
+                case 0x355: {  // Battery 1 SOC
+                    struct batteries_gps_motor_2_soc_soh_1_t msg;
+                    batteries_gps_motor_2_soc_soh_1_unpack(&msg,
+                        rxMessage.data, rxMessage.data_length_code);
+
+                    battery_pack_t pack;
+                    if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
+                        memset(&pack, 0, sizeof(pack));
+                    }
+                    pack.bat[0].soc = (uint8_t)(msg.high_res_soc_1 * 0.01f);
+                    xQueueOverwrite(q_battery, &pack);
+                    break;
+                }
+
+                case 0x356: {  // Battery 2 SOC
+                    struct batteries_gps_motor_2_soc_soh_2_t msg;
+                    batteries_gps_motor_2_soc_soh_2_unpack(&msg,
+                        rxMessage.data, rxMessage.data_length_code);
+
+                    battery_pack_t pack;
+                    if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
+                        memset(&pack, 0, sizeof(pack));
+                    }
+                    pack.bat[1].soc = (uint8_t)(msg.high_res_soc_2 * 0.01f);
+                    xQueueOverwrite(q_battery, &pack);
+                    break;
+                }
+
+                case 0x020: {  // DHT humidity
+                    struct dht_lv_batt_dht_lv_batt_t msg;
+                    dht_lv_batt_dht_lv_batt_unpack(&msg,
+                        rxMessage.data, rxMessage.data_length_code);
+
+                    sensor_data_t sensor;
+                    if (xQueuePeek(q_sensor, &sensor, 0) != pdTRUE) {
+                        memset(&sensor, 0, sizeof(sensor));
+                    }
+                    sensor.humidity = (uint8_t)dht_lv_batt_dht_lv_batt_hum_dht_decode(msg.hum_dht);
+                    xQueueOverwrite(q_sensor, &sensor);
+                    break;
+                }
+
+                case 0x361: {  // Battery 3 voltage, current, temp
+                    struct batteries_gps_motor_2_battery_volt_curr_temp_3_t msg;
+                    batteries_gps_motor_2_battery_volt_curr_temp_3_unpack(&msg,rxMessage.data, rxMessage.data_length_code);
+
+                    battery_pack_t pack;
+                    if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
+                        memset(&pack, 0, sizeof(pack));
+                    }
+                    pack.bat[2].voltage = batteries_gps_motor_2_battery_volt_curr_temp_3_battery_voltage_3_decode(msg.battery_voltage_3);
+                    pack.bat[2].current = batteries_gps_motor_2_battery_volt_curr_temp_3_battery_current_3_decode(msg.battery_current_3);
+                    pack.bat[2].temp_c  = (uint8_t)batteries_gps_motor_2_battery_volt_curr_temp_3_battery_temp_3_decode(msg.battery_temp_3);
+                    xQueueOverwrite(q_battery, &pack);
+                    break;
+                }
+
+                case 0x357: {  // Battery 3 SOC
+                    struct batteries_gps_motor_2_soc_soh_3_t msg;
+                    batteries_gps_motor_2_soc_soh_3_unpack(&msg, rxMessage.data, rxMessage.data_length_code);
+
+                    battery_pack_t pack;
+                    if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
+                        memset(&pack, 0, sizeof(pack));
+                    }
+                    pack.bat[2].soc = (uint8_t)(msg.high_res_soc_3 * 0.01f);
+                    xQueueOverwrite(q_battery, &pack);
+                    break;
+                }
+
+                default:
+                    break;
+            }
+        }
+    }
+}
+
 // ------ Display Task ----------------------------------------------------
 
 static void eve_task(void *pvParameters)
@@ -961,6 +1115,34 @@ void app_main(void)
     wifi_init_sta(); // connection to wifi
     mqtt_app_start(); // mqtt connection
 
+    ESP_LOGI("TWAI", "Initialazing TWAI in NORMAL mode...");
+
+    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX, CAN_RX, TWAI_MODE_NORMAL); 
+    g_config.tx_queue_len = 10;
+    g_config.rx_queue_len = 10;
+    twai_timing_config_t t_config = TWAI_TIMING_CONFIG_250KBITS();  
+ 
+    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();  
+
+    esp_err_t err = twai_driver_install(&g_config, &t_config, &f_config);
+    if (err == ESP_OK)
+    {
+        ESP_LOGI("TWAI", "TWAI installed successfully!");
+        if (twai_start() == ESP_OK)
+        {
+            ESP_LOGI("TWAI", "TWAI started in normal mode!");
+
+        }else{
+            ESP_LOGE("TWAI","Failed to start TWAI");
+            return;
+        }
+        
+    }else{
+        ESP_LOGE("TWAI","Failed to install TWAI");
+        return;
+
+    }
+
     // queues initilization
     q_motor         = xQueueCreate(1, sizeof(motor_data_t));
     q_battery       = xQueueCreate(1, sizeof(battery_pack_t));
@@ -974,8 +1156,9 @@ void app_main(void)
     sensor_data_t  s = {0};   xQueueSend(q_sensor,       &s, 0);
     power_window_t p = {0};   xQueueSend(q_power_window, &p, 0);
 
-    xTaskCreate(fake_can_task, "can",     3072, NULL, 5, NULL);
+    //xTaskCreate(fake_can_task, "can",     3072, NULL, 5, NULL);
+    //xTaskCreate(fake_mqtt_task, "fake_mqtt", 4096, NULL, 3, NULL);
     xTaskCreatePinnedToCore(eve_task, "display", 6144, NULL, 4, NULL, 1);
-    xTaskCreate(fake_mqtt_task, "fake_mqtt", 4096, NULL, 3, NULL);
+    xTaskCreatePinnedToCore(can_receiver_task, "can_task", 4096, NULL, 5, NULL, 0);
     xTaskCreatePinnedToCore(button_task, "button", 2048, NULL, 3, NULL, 1);
 }
