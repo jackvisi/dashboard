@@ -30,6 +30,7 @@
  */
 
 #include <string.h>
+#include <stdio.h>
 
 #include "batteries_gps_motor_2.h"
 
