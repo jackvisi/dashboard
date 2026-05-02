@@ -26,8 +26,8 @@
 #include "dht_lv_batt.h"
 #include "driver/twai.h"
 // can pins
-#define CAN_TX  GPIO_NUM_21
-#define CAN_RX  GPIO_NUM_22
+#define CAN_TX  GPIO_NUM_41
+#define CAN_RX  GPIO_NUM_42
 
 //WIFI credentials
 #define WIFI_SSID "iPhone di Giacomo"

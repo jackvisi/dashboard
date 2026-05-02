@@ -19,4 +19,5 @@ idf_component_register(
 target_compile_definitions(${COMPONENT_LIB} PUBLIC
     EVE_NHD_70
     FT812
+
 )
