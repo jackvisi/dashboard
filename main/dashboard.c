@@ -185,6 +185,15 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,int32_t
                 cJSON *max = cJSON_GetObjectItem(root, "powerMax");
 
                 if (cJSON_IsNumber(min) && cJSON_IsNumber(max)) {
+                    if (min->valuedouble == 0 && max->valuedouble == 0){
+                        power_window_t pw = {
+                        .range_min_kw = 0,
+                        .range_max_kw = 0,
+                        .active       = false
+                        };
+                        xQueueOverwrite(q_power_window, &pw);
+                        break;
+                    }
                     power_window_t pw = {
                         .range_min_kw = (float)min->valuedouble,
                         .range_max_kw = (float)max->valuedouble,
@@ -193,7 +202,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,int32_t
                     xQueueOverwrite(q_power_window, &pw);
                 }
 
-                cJSON_Delete(root);  // ← mancava
+                cJSON_Delete(root);  
             }
             break;  
         }           
@@ -1117,7 +1126,7 @@ void app_main(void)
     wifi_init_sta(); // connection to wifi
     mqtt_app_start(); // mqtt connection
 
-    ESP_LOGI("TWAI", "Initialazing TWAI in NORMAL mode...");
+    /*ESP_LOGI("TWAI", "Initialazing TWAI in NORMAL mode...");
 
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX, CAN_RX, TWAI_MODE_NORMAL); 
     g_config.tx_queue_len = 10;
@@ -1143,7 +1152,7 @@ void app_main(void)
         ESP_LOGE("TWAI","Failed to install TWAI");
         return;
 
-    }
+    }*/
 
     // queues initilization
     q_motor         = xQueueCreate(1, sizeof(motor_data_t));
@@ -1158,9 +1167,9 @@ void app_main(void)
     sensor_data_t  s = {0};   xQueueSend(q_sensor,       &s, 0);
     power_window_t p = {0};   xQueueSend(q_power_window, &p, 0);
 
-    //xTaskCreate(fake_can_task, "can",     3072, NULL, 5, NULL);
+    xTaskCreate(fake_can_task, "can",     3072, NULL, 5, NULL);
     //xTaskCreate(fake_mqtt_task, "fake_mqtt", 4096, NULL, 3, NULL);
     xTaskCreatePinnedToCore(eve_task, "display", 6144, NULL, 4, NULL, 1);
-    xTaskCreatePinnedToCore(can_receiver_task, "can_task", 4096, NULL, 5, NULL, 0);
+    //xTaskCreatePinnedToCore(can_receiver_task, "can_task", 4096, NULL, 5, NULL, 0);
     xTaskCreatePinnedToCore(button_task, "button", 2048, NULL, 3, NULL, 1);
 }
