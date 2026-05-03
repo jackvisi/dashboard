@@ -39,7 +39,7 @@ static int maxretries = 5;
 #define RX_PAYLOAD_MAX 256
 
 // for the button
-#define BTN_PIN GPIO_NUM_13
+#define BTN_PIN GPIO_NUM_40
 static volatile uint8_t current_screen = 0;
 
 //mqtt global client
