@@ -892,8 +892,7 @@ void can_receiver_task(void *pvParameters)
 
                 case 0x15F40200: {  // Motor RPM + Power
                     struct motor_estimated_motor_estimated_t msg;
-                    motor_estimated_motor_estimated_unpack(&msg,
-                        rxMessage.data, rxMessage.data_length_code);
+                    motor_estimated_motor_estimated_unpack(&msg,rxMessage.data, rxMessage.data_length_code);
 
                     motor_data_t motor;
                     if (xQueuePeek(q_motor, &motor, 0) != pdTRUE) {
@@ -907,8 +906,7 @@ void can_receiver_task(void *pvParameters)
 
                 case 0x7: {  // GPS Speed
                     struct batteries_gps_motor_2_gnss_speed_t msg;
-                    batteries_gps_motor_2_gnss_speed_unpack(&msg,
-                        rxMessage.data, rxMessage.data_length_code);
+                    batteries_gps_motor_2_gnss_speed_unpack(&msg, rxMessage.data, rxMessage.data_length_code);
 
                     motor_data_t motor;
                     if (xQueuePeek(q_motor, &motor, 0) != pdTRUE) {
@@ -937,8 +935,7 @@ void can_receiver_task(void *pvParameters)
 
                 case 0x360: {  // Battery 2 voltage, current, temp
                     struct batteries_gps_motor_2_battery_volt_curr_temp_2_t msg;
-                    batteries_gps_motor_2_battery_volt_curr_temp_2_unpack(&msg,
-                        rxMessage.data, rxMessage.data_length_code);
+                    batteries_gps_motor_2_battery_volt_curr_temp_2_unpack(&msg, rxMessage.data, rxMessage.data_length_code);
 
                     battery_pack_t pack;
                     if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
@@ -953,8 +950,7 @@ void can_receiver_task(void *pvParameters)
 
                 case 0x355: {  // Battery 1 SOC
                     struct batteries_gps_motor_2_soc_soh_1_t msg;
-                    batteries_gps_motor_2_soc_soh_1_unpack(&msg,
-                        rxMessage.data, rxMessage.data_length_code);
+                    batteries_gps_motor_2_soc_soh_1_unpack(&msg,rxMessage.data, rxMessage.data_length_code);
 
                     battery_pack_t pack;
                     if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
@@ -967,8 +963,7 @@ void can_receiver_task(void *pvParameters)
 
                 case 0x356: {  // Battery 2 SOC
                     struct batteries_gps_motor_2_soc_soh_2_t msg;
-                    batteries_gps_motor_2_soc_soh_2_unpack(&msg,
-                        rxMessage.data, rxMessage.data_length_code);
+                    batteries_gps_motor_2_soc_soh_2_unpack(&msg,rxMessage.data, rxMessage.data_length_code);
 
                     battery_pack_t pack;
                     if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
@@ -981,8 +976,7 @@ void can_receiver_task(void *pvParameters)
 
                 case 0x020: {  // DHT humidity
                     struct dht_lv_batt_dht_lv_batt_t msg;
-                    dht_lv_batt_dht_lv_batt_unpack(&msg,
-                        rxMessage.data, rxMessage.data_length_code);
+                    dht_lv_batt_dht_lv_batt_unpack(&msg,rxMessage.data, rxMessage.data_length_code);
 
                     sensor_data_t sensor;
                     if (xQueuePeek(q_sensor, &sensor, 0) != pdTRUE) {
