@@ -904,7 +904,7 @@ void can_receiver_task(void *pvParameters)
                     break;
                 }
 
-                case 0x7: {  // GPS Speed
+                case 0x07: {  // GPS Speed
                     struct batteries_gps_motor_2_gnss_speed_t msg;
                     batteries_gps_motor_2_gnss_speed_unpack(&msg, rxMessage.data, rxMessage.data_length_code);
 
