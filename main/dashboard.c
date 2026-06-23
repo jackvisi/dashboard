@@ -9,6 +9,7 @@
 #include "esp_timer.h"
 #include "EVE.h"
 #include "EVE_commands.h"
+#include "esp_task_wdt.h"
 
 #include "mqtt_client.h"
 #include "esp_netif.h"
@@ -30,9 +31,9 @@
 #define CAN_RX  GPIO_NUM_42
 
 //WIFI credentials
-#define WIFI_SSID "iPhone di Giacomo"
-#define WIFI_PASS "labarca123"
-static int maxretries = 5;
+#define WIFI_SSID "DTU_FF_Boat_Team"
+#define WIFI_PASS "DTUBoatFF2425#"
+static int maxretries = 207;
 
 // for the mqtt messages
 #define RX_TOPIC_MAX   128
@@ -41,6 +42,10 @@ static int maxretries = 5;
 // for the button
 #define BTN_PIN GPIO_NUM_40
 static volatile uint8_t current_screen = 0;
+
+#define CRUISE_BTN_PIN  GPIO_NUM_39   
+#define CRUISE_RPM      400           
+#define CRUISE_CAN_ID   0x300
 
 //mqtt global client
 static esp_mqtt_client_handle_t mqtt_client;
@@ -107,6 +112,7 @@ static QueueHandle_t q_mqtt_msgs;
 
 //----- WiFi and MQTT initilization ---------------------------------
 static bool wifi_connected = false;
+static int retry_count = 0;
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,int32_t event_id, void* event_data)
 {
@@ -114,19 +120,26 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,int32_t ev
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED && maxretries > 0) {
         wifi_connected = false;
-        esp_wifi_connect();
+        if (retry_count < maxretries) {
+            retry_count++;
+            vTaskDelay(pdMS_TO_TICKS(500 * retry_count));  // backoff crescente
+            esp_wifi_connect();
+        }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         wifi_connected = true;
+        retry_count = 0;
     }
 }
 
 static bool mqtt_connected = false;
+
 //mqtt events handler
 
 // message format: -powerMin, powerMax --> json, text-->string
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base,int32_t event_id, void *event_data)
 {
     esp_mqtt_event_handle_t event = event_data;
+
 
     switch (event->event_id) {
 
@@ -192,6 +205,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,int32_t
                         .active       = false
                         };
                         xQueueOverwrite(q_power_window, &pw);
+                        cJSON_Delete(root);  
                         break;
                     }
                     power_window_t pw = {
@@ -222,7 +236,7 @@ static void mqtt_app_start(void)
 {
     esp_mqtt_client_config_t mqtt_cfg = {
     .broker.address.uri = "mqtts://fbe643f0aede453b8a874f9eef1b696b.s1.eu.hivemq.cloud:8883",
-    .credentials.client_id = "ESP32Telemetry",
+    .credentials.client_id = "ESP32Telemetry2",
     .credentials.username = "ffServer",
     .credentials.authentication.password = "BoatServer25",
     .broker.verification.use_global_ca_store = false,
@@ -865,18 +879,51 @@ static void fake_can_task(void *pvParameters)
 }
 
 // -------- Button Task ---------------------------------------------------
+typedef struct {
+    uint8_t  cruise_on;     // 1 = attiva cruise, 0 = disattiva
+    int16_t  cruise_rpm;    // rpm fissi (signed)
+} __attribute__((packed)) cruise_cmd_t;
+
+static void send_cruise_cmd(bool on, int16_t rpm)
+{
+    cruise_cmd_t c = { .cruise_on = on ? 1 : 0, .cruise_rpm = rpm };
+
+    twai_message_t frame = {
+        .identifier       = CRUISE_CAN_ID,
+        .extd             = 0,                    
+        .data_length_code = sizeof(cruise_cmd_t),
+    };
+    memcpy(frame.data, &c, sizeof(c));
+
+    esp_err_t err = twai_transmit(&frame, pdMS_TO_TICKS(100));
+    if (err == ESP_OK) {
+        ESP_LOGI(LOG_TAG, "Cruise cmd sent: on=%d rpm=%d", c.cruise_on, c.cruise_rpm);
+    } else {
+        ESP_LOGE(LOG_TAG, "Cruise cmd TX failed: %s", esp_err_to_name(err));
+    }
+}
+
 static void button_task(void *pvParameters)
 {
-    bool btn_prev = true;
+    bool btn_prev    = true;   // bottone schermo
+    bool cruise_prev = true;   // bottone cruise
 
     while (1) {
-        bool btn = gpio_get_level(BTN_PIN);
+        bool btn    = gpio_get_level(BTN_PIN);
+        bool cruise = gpio_get_level(CRUISE_BTN_PIN);
 
+        // bottone schermo (già esistente)
         if (btn_prev == true && btn == false) {
             current_screen = (current_screen + 1) % 3;
         }
 
-        btn_prev = btn;
+        // bottone cruise: alla premuta, manda il frame
+        if (cruise_prev == true && cruise == false) {
+            send_cruise_cmd(true, CRUISE_RPM);
+        }
+
+        btn_prev    = btn;
+        cruise_prev = cruise;
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
@@ -884,9 +931,10 @@ static void button_task(void *pvParameters)
 // ---------CAN Receiver Task ---------------------------------------------
 void can_receiver_task(void *pvParameters)
 {
+    esp_task_wdt_add(NULL);
     while (1) {
         twai_message_t rxMessage;
-        while (twai_receive(&rxMessage, pdMS_TO_TICKS(10)) == ESP_OK) {
+        if (twai_receive(&rxMessage, pdMS_TO_TICKS(10)) == ESP_OK) {
 
             switch (rxMessage.identifier) {
 
@@ -1019,6 +1067,7 @@ void can_receiver_task(void *pvParameters)
                     break;
             }
         }
+        esp_task_wdt_reset();
     }
 }
 
@@ -1026,6 +1075,7 @@ void can_receiver_task(void *pvParameters)
 
 static void eve_task(void *pvParameters)
 {
+    esp_task_wdt_add(NULL);
     EVE_init_spi();
 
     uint8_t ret = EVE_init();
@@ -1046,7 +1096,7 @@ static void eve_task(void *pvParameters)
     mqtt_messages_t msgs     = {0};
 
     // initial message
-    strncpy(msgs.lines[0], "Waiting for messages...",
+    strncpy(msgs.lines[0], "",
             MQTT_MSG_MAX_LEN - 1);
     msgs.count = MQTT_MSG_MAX_ROWS;
 
@@ -1094,8 +1144,9 @@ static void eve_task(void *pvParameters)
         EVE_execute_cmd();
         //int64_t t1 = esp_timer_get_time();
         //ESP_LOGI(LOG_TAG, "frame: %lld us", t1 - t0);
+        esp_task_wdt_reset();
 
-        vTaskDelay(pdMS_TO_TICKS(33));
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
@@ -1107,7 +1158,7 @@ void app_main(void)
 {
     // button configurations
     gpio_config_t cfg = {
-        .pin_bit_mask = (1ULL << BTN_PIN),
+        .pin_bit_mask = (1ULL << BTN_PIN) | (1ULL << CRUISE_BTN_PIN),
         .mode         = GPIO_MODE_INPUT,
         .pull_up_en   = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -1120,7 +1171,7 @@ void app_main(void)
     wifi_init_sta(); // connection to wifi
     mqtt_app_start(); // mqtt connection
 
-    /*ESP_LOGI("TWAI", "Initialazing TWAI in NORMAL mode...");
+    ESP_LOGI("TWAI", "Initialazing TWAI in NORMAL mode...");
 
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX, CAN_RX, TWAI_MODE_NORMAL); 
     g_config.tx_queue_len = 10;
@@ -1146,7 +1197,7 @@ void app_main(void)
         ESP_LOGE("TWAI","Failed to install TWAI");
         return;
 
-    }*/
+    }
 
     // queues initilization
     q_motor         = xQueueCreate(1, sizeof(motor_data_t));
@@ -1161,9 +1212,9 @@ void app_main(void)
     sensor_data_t  s = {0};   xQueueSend(q_sensor,       &s, 0);
     power_window_t p = {0};   xQueueSend(q_power_window, &p, 0);
 
-    xTaskCreate(fake_can_task, "can",     3072, NULL, 5, NULL);
+    //xTaskCreate(fake_can_task, "can",     3072, NULL, 5, NULL);
     //xTaskCreate(fake_mqtt_task, "fake_mqtt", 4096, NULL, 3, NULL);
-    xTaskCreatePinnedToCore(eve_task, "display", 6144, NULL, 4, NULL, 1);
-    //xTaskCreatePinnedToCore(can_receiver_task, "can_task", 4096, NULL, 5, NULL, 0);
-    xTaskCreatePinnedToCore(button_task, "button", 2048, NULL, 3, NULL, 1);
+    xTaskCreatePinnedToCore(eve_task, "display", 6144, NULL, 4, NULL, 0);
+    xTaskCreatePinnedToCore(can_receiver_task, "can_task", 4096, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(button_task, "button", 2048, NULL, 3, NULL, 0);
 }
