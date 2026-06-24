@@ -5,6 +5,7 @@ idf_component_register(
         "nma2000_motor.c"
         "motor_estimated.c"
         "dht_lv_batt.c"
+        "gvi_motor.c"
     INCLUDE_DIRS "."
     REQUIRES EVE esp_timer nvs_flash esp_wifi esp_event esp_netif mqtt json driver
 )
