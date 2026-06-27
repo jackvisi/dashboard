@@ -13,6 +13,6 @@
     "--query-driver=**",
     "--compile-commands-dir=c:\\Users\\jackv\\OneDrive\\Documenti\\uni\\dtu\\boat\\display\\build"
   ],
-  "idf.portWin": "COM7",
+  "idf.portWin": "COM12",
   "idf.flashType": "UART"
 }

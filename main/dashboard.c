@@ -27,6 +27,7 @@
 #include "gvi_motor.h"
 #include "dht_lv_batt.h"
 #include "driver/twai.h"
+#include "batteries.h"
 // can pins
 #define CAN_TX  GPIO_NUM_41
 #define CAN_RX  GPIO_NUM_42
@@ -85,7 +86,7 @@ typedef struct {
 } battery_t;
 
 typedef struct {
-    battery_t bat[5];
+    battery_t bat[3];
 } battery_pack_t;
 
 typedef struct {
@@ -992,7 +993,7 @@ void can_receiver_task(void *pvParameters)
                             memset(&motor, 0, sizeof(motor));
                         }
 
-                        motor.currentdc = (int16_t)gvi_motor_gvi_status_tx_pdo1_rms_motor_current_decode(m.dc_bus_current);
+                        motor.currentdc = (int16_t)gvi_motor_diagnostic1_tx_pdo2_dc_bus_current_decode(m.dc_bus_current);
 
                         xQueueOverwrite(q_motor, &motor);
                     }
@@ -1028,113 +1029,57 @@ void can_receiver_task(void *pvParameters)
                     break;
                 }
 
-                case 0x359: {  // Battery_VoltCurrTemp_1
-                    struct batteries_gps_motor_2_battery_volt_curr_temp_1_t m;
-                    if (batteries_gps_motor_2_battery_volt_curr_temp_1_unpack(&m, rxMessage.data, rxMessage.data_length_code) == 0){
+                case 0x04028001: {  // Battery_VoltCurrSOC_1
+                    struct batteries_total_info_0_batt1_t m;
+                    if (batteries_total_info_0_batt1_unpack(&m, rxMessage.data, rxMessage.data_length_code) == 0){
                         battery_pack_t pack;
                         if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
                             memset(&pack, 0, sizeof(pack));
                         }
-                        pack.bat[0].voltage = batteries_gps_motor_2_battery_volt_curr_temp_1_battery_voltage_1_decode(m.battery_voltage_1);
-                        pack.bat[0].current = batteries_gps_motor_2_battery_volt_curr_temp_1_battery_current_1_decode(m.battery_current_1);
-                        pack.bat[0].temp_c  = (uint8_t)batteries_gps_motor_2_battery_volt_curr_temp_1_battery_temp_1_decode(m.battery_temp_1);
+                        pack.bat[0].voltage = batteries_total_info_0_batt1_voltage_1_decode(m.voltage_1);
+                        pack.bat[0].current = batteries_total_info_0_batt1_current_1_decode(m.current_1);
+                        pack.bat[0].soc = (uint8_t)(batteries_total_info_0_batt1_soc_1_decode(m.soc_1));
+                        xQueueOverwrite(q_battery, &pack);
+                    }
+                    break;  
+                }
+
+                case 0x04028002: {  // Battery_VoltCurrSOC_2
+                    struct batteries_total_info_0_batt2_t m;
+                    if (batteries_total_info_0_batt2_unpack(&m, rxMessage.data, rxMessage.data_length_code) == 0){
+                        battery_pack_t pack;
+                        if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
+                            memset(&pack, 0, sizeof(pack));
+                        }
+                        pack.bat[1].voltage = batteries_total_info_0_batt2_voltage_2_decode(m.voltage_2);
+                        pack.bat[1].current = batteries_total_info_0_batt2_current_2_decode(m.current_2);
+                        pack.bat[1].soc = (uint8_t)(batteries_total_info_0_batt2_soc_2_decode(m.soc_2));
+                        xQueueOverwrite(q_battery, &pack);
+                    }
+                    break;  
+                }
+
+                case 0x04058001: {  // temperatures b1
+                    struct batteries_temperature_1_t m;
+                    if (batteries_temperature_1_unpack(&m, rxMessage.data, rxMessage.data_length_code) == 0){
+                        battery_pack_t pack;
+                        if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
+                            memset(&pack, 0, sizeof(pack));
+                        }
+                        pack.bat[0].temp_c = batteries_temperature_1_max_t_1_decode(m.max_t_1);
                         xQueueOverwrite(q_battery, &pack);
                     }
                     break;
                 }
 
-                case 0x360: {  // Battery_VoltCurrTemp_2
-                    struct batteries_gps_motor_2_battery_volt_curr_temp_2_t m;
-                    if (batteries_gps_motor_2_battery_volt_curr_temp_2_unpack(&m, rxMessage.data, rxMessage.data_length_code) == 0){
+                case 0x04058002: {  // temperatures b2
+                    struct batteries_temperature_2_t m;
+                    if (batteries_temperature_2_unpack(&m, rxMessage.data, rxMessage.data_length_code) == 0){
                         battery_pack_t pack;
                         if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
                             memset(&pack, 0, sizeof(pack));
                         }
-                        pack.bat[1].voltage = batteries_gps_motor_2_battery_volt_curr_temp_2_battery_voltage_2_decode(m.battery_voltage_2);
-                        pack.bat[1].current = batteries_gps_motor_2_battery_volt_curr_temp_2_battery_current_2_decode(m.battery_current_2);
-                        pack.bat[1].temp_c  = (uint8_t)batteries_gps_motor_2_battery_volt_curr_temp_2_battery_temp_2_decode(m.battery_temp_2);
-                        xQueueOverwrite(q_battery, &pack);
-                    }
-                    break;
-                }
-
-                case 0x361: {  // Battery_VoltCurrTemp_3
-                    struct batteries_gps_motor_2_battery_volt_curr_temp_3_t m;
-                    if (batteries_gps_motor_2_battery_volt_curr_temp_3_unpack(&m, rxMessage.data, rxMessage.data_length_code) == 0){
-                        battery_pack_t pack;
-                        if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
-                            memset(&pack, 0, sizeof(pack));
-                        }
-                        pack.bat[2].voltage = batteries_gps_motor_2_battery_volt_curr_temp_3_battery_voltage_3_decode(m.battery_voltage_3);
-                        pack.bat[2].current = batteries_gps_motor_2_battery_volt_curr_temp_3_battery_current_3_decode(m.battery_current_3);
-                        pack.bat[2].temp_c  = (uint8_t)batteries_gps_motor_2_battery_volt_curr_temp_3_battery_temp_3_decode(m.battery_temp_3);
-                        xQueueOverwrite(q_battery, &pack);
-                    }
-                    break;
-                }
-
-                case 0x362: {  // Battery_VoltCurrTemp_4
-                    struct batteries_gps_motor_2_battery_volt_curr_temp_4_t m;
-                    if (batteries_gps_motor_2_battery_volt_curr_temp_4_unpack(&m, rxMessage.data, rxMessage.data_length_code) == 0){
-                        battery_pack_t pack;
-                        if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
-                            memset(&pack, 0, sizeof(pack));
-                        }
-                        pack.bat[3].voltage = batteries_gps_motor_2_battery_volt_curr_temp_4_battery_voltage_4_decode(m.battery_voltage_4);
-                        pack.bat[3].current = batteries_gps_motor_2_battery_volt_curr_temp_4_battery_current_4_decode(m.battery_current_4);
-                        pack.bat[3].temp_c  = (uint8_t)batteries_gps_motor_2_battery_volt_curr_temp_4_battery_temp_4_decode(m.battery_temp_4);
-                        xQueueOverwrite(q_battery, &pack);
-                    }
-                    break;
-                }
-
-                case 0x355: {  // Battery 1 SOC
-                    struct batteries_gps_motor_2_soc_soh_1_t msg;
-                    if(batteries_gps_motor_2_soc_soh_1_unpack(&msg,rxMessage.data, rxMessage.data_length_code)==0){
-                        battery_pack_t pack;
-                        if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
-                            memset(&pack, 0, sizeof(pack));
-                        }
-                        pack.bat[0].soc = (uint8_t)(msg.high_res_soc_1 * 0.01f);
-                        xQueueOverwrite(q_battery, &pack);
-                    }
-                    break;
-                }
-
-                case 0x356: {  // Battery 2 SOC
-                    struct batteries_gps_motor_2_soc_soh_2_t msg;
-                    if(batteries_gps_motor_2_soc_soh_2_unpack(&msg,rxMessage.data, rxMessage.data_length_code)==0){
-                        battery_pack_t pack;
-                        if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
-                            memset(&pack, 0, sizeof(pack));
-                        }
-                        pack.bat[1].soc = (uint8_t)(msg.high_res_soc_2 * 0.01f);
-                        xQueueOverwrite(q_battery, &pack);
-                    }
-                    break;
-                }
-
-                case 0x357: {  // Battery 3 SOC
-                    struct batteries_gps_motor_2_soc_soh_3_t msg;
-                    if(batteries_gps_motor_2_soc_soh_3_unpack(&msg,rxMessage.data, rxMessage.data_length_code)==0){
-                        battery_pack_t pack;
-                        if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
-                            memset(&pack, 0, sizeof(pack));
-                        }
-                        pack.bat[2].soc = (uint8_t)(msg.high_res_soc_3 * 0.01f);
-                        xQueueOverwrite(q_battery, &pack);
-                    }
-                    break;
-                }
-
-                case 0x358: {  // Battery 4 SOC
-                    struct batteries_gps_motor_2_soc_soh_4_t msg;
-                    if(batteries_gps_motor_2_soc_soh_4_unpack(&msg,rxMessage.data, rxMessage.data_length_code)==0){
-                        battery_pack_t pack;
-                        if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
-                            memset(&pack, 0, sizeof(pack));
-                        }
-                        pack.bat[3].soc = (uint8_t)(msg.high_res_soc_4 * 0.01f);
+                        pack.bat[1].temp_c = batteries_temperature_2_max_t_2_decode(m.max_t_2);
                         xQueueOverwrite(q_battery, &pack);
                     }
                     break;
@@ -1310,3 +1255,115 @@ void app_main(void)
     xTaskCreatePinnedToCore(can_receiver_task, "can_task", 4096, NULL, 5, NULL, 1);
     xTaskCreatePinnedToCore(button_task, "button", 2048, NULL, 3, NULL, 0);
 }
+
+/*case 0x359: {  // Battery_VoltCurrTemp_1
+                    struct batteries_gps_motor_2_battery_volt_curr_temp_1_t m;
+                    if (batteries_gps_motor_2_battery_volt_curr_temp_1_unpack(&m, rxMessage.data, rxMessage.data_length_code) == 0){
+                        battery_pack_t pack;
+                        if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
+                            memset(&pack, 0, sizeof(pack));
+                        }
+                        pack.bat[0].voltage = batteries_gps_motor_2_battery_volt_curr_temp_1_battery_voltage_1_decode(m.battery_voltage_1);
+                        pack.bat[0].current = batteries_gps_motor_2_battery_volt_curr_temp_1_battery_current_1_decode(m.battery_current_1);
+                        pack.bat[0].temp_c  = (uint8_t)batteries_gps_motor_2_battery_volt_curr_temp_1_battery_temp_1_decode(m.battery_temp_1);
+                        xQueueOverwrite(q_battery, &pack);
+                    }
+                    break;
+                }
+
+                case 0x360: {  // Battery_VoltCurrTemp_2
+                    struct batteries_gps_motor_2_battery_volt_curr_temp_2_t m;
+                    if (batteries_gps_motor_2_battery_volt_curr_temp_2_unpack(&m, rxMessage.data, rxMessage.data_length_code) == 0){
+                        battery_pack_t pack;
+                        if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
+                            memset(&pack, 0, sizeof(pack));
+                        }
+                        pack.bat[1].voltage = batteries_gps_motor_2_battery_volt_curr_temp_2_battery_voltage_2_decode(m.battery_voltage_2);
+                        pack.bat[1].current = batteries_gps_motor_2_battery_volt_curr_temp_2_battery_current_2_decode(m.battery_current_2);
+                        pack.bat[1].temp_c  = (uint8_t)batteries_gps_motor_2_battery_volt_curr_temp_2_battery_temp_2_decode(m.battery_temp_2);
+                        xQueueOverwrite(q_battery, &pack);
+                    }
+                    break;
+                }
+
+                case 0x361: {  // Battery_VoltCurrTemp_3
+                    struct batteries_gps_motor_2_battery_volt_curr_temp_3_t m;
+                    if (batteries_gps_motor_2_battery_volt_curr_temp_3_unpack(&m, rxMessage.data, rxMessage.data_length_code) == 0){
+                        battery_pack_t pack;
+                        if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
+                            memset(&pack, 0, sizeof(pack));
+                        }
+                        pack.bat[2].voltage = batteries_gps_motor_2_battery_volt_curr_temp_3_battery_voltage_3_decode(m.battery_voltage_3);
+                        pack.bat[2].current = batteries_gps_motor_2_battery_volt_curr_temp_3_battery_current_3_decode(m.battery_current_3);
+                        pack.bat[2].temp_c  = (uint8_t)batteries_gps_motor_2_battery_volt_curr_temp_3_battery_temp_3_decode(m.battery_temp_3);
+                        xQueueOverwrite(q_battery, &pack);
+                    }
+                    break;
+                }
+
+                case 0x362: {  // Battery_VoltCurrTemp_4
+                    struct batteries_gps_motor_2_battery_volt_curr_temp_4_t m;
+                    if (batteries_gps_motor_2_battery_volt_curr_temp_4_unpack(&m, rxMessage.data, rxMessage.data_length_code) == 0){
+                        battery_pack_t pack;
+                        if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
+                            memset(&pack, 0, sizeof(pack));
+                        }
+                        pack.bat[3].voltage = batteries_gps_motor_2_battery_volt_curr_temp_4_battery_voltage_4_decode(m.battery_voltage_4);
+                        pack.bat[3].current = batteries_gps_motor_2_battery_volt_curr_temp_4_battery_current_4_decode(m.battery_current_4);
+                        pack.bat[3].temp_c  = (uint8_t)batteries_gps_motor_2_battery_volt_curr_temp_4_battery_temp_4_decode(m.battery_temp_4);
+                        xQueueOverwrite(q_battery, &pack);
+                    }
+                    break;
+                }
+
+                case 0x355: {  // Battery 1 SOC
+                    struct batteries_gps_motor_2_soc_soh_1_t msg;
+                    if(batteries_gps_motor_2_soc_soh_1_unpack(&msg,rxMessage.data, rxMessage.data_length_code)==0){
+                        battery_pack_t pack;
+                        if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
+                            memset(&pack, 0, sizeof(pack));
+                        }
+                        pack.bat[0].soc = (uint8_t)(msg.high_res_soc_1 * 0.01f);
+                        xQueueOverwrite(q_battery, &pack);
+                    }
+                    break;
+                }
+
+                case 0x356: {  // Battery 2 SOC
+                    struct batteries_gps_motor_2_soc_soh_2_t msg;
+                    if(batteries_gps_motor_2_soc_soh_2_unpack(&msg,rxMessage.data, rxMessage.data_length_code)==0){
+                        battery_pack_t pack;
+                        if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
+                            memset(&pack, 0, sizeof(pack));
+                        }
+                        pack.bat[1].soc = (uint8_t)(msg.high_res_soc_2 * 0.01f);
+                        xQueueOverwrite(q_battery, &pack);
+                    }
+                    break;
+                }
+
+                case 0x357: {  // Battery 3 SOC
+                    struct batteries_gps_motor_2_soc_soh_3_t msg;
+                    if(batteries_gps_motor_2_soc_soh_3_unpack(&msg,rxMessage.data, rxMessage.data_length_code)==0){
+                        battery_pack_t pack;
+                        if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
+                            memset(&pack, 0, sizeof(pack));
+                        }
+                        pack.bat[2].soc = (uint8_t)(msg.high_res_soc_3 * 0.01f);
+                        xQueueOverwrite(q_battery, &pack);
+                    }
+                    break;
+                }
+
+                case 0x358: {  // Battery 4 SOC
+                    struct batteries_gps_motor_2_soc_soh_4_t msg;
+                    if(batteries_gps_motor_2_soc_soh_4_unpack(&msg,rxMessage.data, rxMessage.data_length_code)==0){
+                        battery_pack_t pack;
+                        if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
+                            memset(&pack, 0, sizeof(pack));
+                        }
+                        pack.bat[3].soc = (uint8_t)(msg.high_res_soc_4 * 0.01f);
+                        xQueueOverwrite(q_battery, &pack);
+                    }
+                    break;
+                }*/
