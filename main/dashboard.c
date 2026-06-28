@@ -56,10 +56,10 @@ static const char *LOG_TAG = "DASH";
 
 // macros used in the drawings
 #define PI              3.14159265f
-#define MAX_POWER_KW    60.0f
-#define MAX_RPM         3000.0f
+#define MAX_POWER_KW    30f
+#define MAX_RPM         4000.0f
 #define MAX_SPD         50.0f
-#define BAT_TEMP_WARN   55
+#define BAT_TEMP_WARN   
 #define BAT_TEMP_ERROR  60
 #define HUM_WARN        75
 
@@ -961,10 +961,11 @@ static void button_task(void *pvParameters)
 void can_receiver_task(void *pvParameters)
 {
     esp_task_wdt_add(NULL);
+    twai_message_t rxMessage;
     while (1) {
-        twai_message_t rxMessage;
-        if (twai_receive(&rxMessage, pdMS_TO_TICKS(10)) == ESP_OK) {
-
+        //ESP_LOGI("CAN", "while 1");
+        while (twai_receive(&rxMessage, pdMS_TO_TICKS(10)) == ESP_OK) {
+            //ESP_LOGI("CAN", "while twai receive");
             switch (rxMessage.identifier) {
 
                 case GVI_MOTOR_GVI_STATUS_TX_PDO1_FRAME_ID: {  // 0x186
@@ -1046,7 +1047,9 @@ void can_receiver_task(void *pvParameters)
 
                 case 0x04028002: {  // Battery_VoltCurrSOC_2
                     struct batteries_total_info_0_batt2_t m;
+                    ESP_LOGI("CAN", "dentro 04028002 unpack");
                     if (batteries_total_info_0_batt2_unpack(&m, rxMessage.data, rxMessage.data_length_code) == 0){
+                        ESP_LOGI("CAN", "dentro 04028002 unpack");
                         battery_pack_t pack;
                         if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
                             memset(&pack, 0, sizeof(pack));
@@ -1082,6 +1085,7 @@ void can_receiver_task(void *pvParameters)
                         pack.bat[1].temp_c = batteries_temperature_2_max_t_2_decode(m.max_t_2);
                         xQueueOverwrite(q_battery, &pack);
                     }
+                    //ESP_LOGI("CAN", "ciao funziona");
                     break;
                 }
 
@@ -1090,19 +1094,28 @@ void can_receiver_task(void *pvParameters)
                     dht_lv_batt_dht_lv_batt_unpack(&msg,rxMessage.data, rxMessage.data_length_code);
 
                     sensor_data_t sensor;
+                    battery_pack_t pack;
                     if (xQueuePeek(q_sensor, &sensor, 0) != pdTRUE) {
                         memset(&sensor, 0, sizeof(sensor));
                     }
+
+                    pack.bat[2].temp_c = dht_lv_batt_dht_lv_batt_temp_dht_decode(msg.temp_dht);
                     sensor.humidity = (uint8_t)dht_lv_batt_dht_lv_batt_hum_dht_decode(msg.hum_dht);
                     xQueueOverwrite(q_sensor, &sensor);
                     break;
                 }
 
+
+
                 default:
+                //ESP_LOGI("CAN", "id=0x%08lX extd=%d dlc=%d",
+             //(unsigned long)rxMessage.identifier,
+             //rxMessage.extd, rxMessage.data_length_code);
                     break;
             }
         }
         esp_task_wdt_reset();
+        vTaskDelay(pdMS_TO_TICKS(2)); 
     }
 }
 
@@ -1116,6 +1129,7 @@ static void eve_task(void *pvParameters)
     uint8_t ret = EVE_init();
     if (ret != 0U) {
         ESP_LOGE(LOG_TAG, "EVE_init fallito ret=%d", ret);
+        esp_task_wdt_delete(NULL);
         vTaskDelete(NULL);
         return;
     }
@@ -1223,9 +1237,10 @@ void app_main(void)
 
     ESP_LOGI("TWAI", "Initialazing TWAI in NORMAL mode...");
 
-    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX, CAN_RX, TWAI_MODE_NORMAL); 
-    g_config.tx_queue_len = 10;
-    g_config.rx_queue_len = 10;
+    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX, CAN_RX, TWAI_MODE_LISTEN_ONLY); 
+    g_config.tx_queue_len = 20;
+    g_config.rx_queue_len = 30;
+    twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
     twai_timing_config_t t_config = TWAI_TIMING_CONFIG_250KBITS();  
  
     twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();  
@@ -1252,8 +1267,8 @@ void app_main(void)
     //xTaskCreate(fake_can_task, "can",     3072, NULL, 5, NULL);
     //xTaskCreate(fake_mqtt_task, "fake_mqtt", 4096, NULL, 3, NULL);
     xTaskCreatePinnedToCore(eve_task, "display", 6144, NULL, 4, NULL, 0);
-    xTaskCreatePinnedToCore(can_receiver_task, "can_task", 4096, NULL, 5, NULL, 1);
-    xTaskCreatePinnedToCore(button_task, "button", 2048, NULL, 3, NULL, 0);
+    xTaskCreatePinnedToCore(can_receiver_task, "can_task", 6144, NULL, 6, NULL, 1);
+    xTaskCreatePinnedToCore(button_task, "button", 4096, NULL, 3, NULL, 0);
 }
 
 /*case 0x359: {  // Battery_VoltCurrTemp_1
