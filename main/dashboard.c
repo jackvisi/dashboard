@@ -18,12 +18,13 @@
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_crt_bundle.h"
+#include "freertos/semphr.h"
 
 #include "cJSON.h"
 
 #include "batteries_gps_motor_2.h"  // FF DTU Boat CAN Library
-#include "nma2000_motor.h"
-#include "motor_estimated.h"  // NMA2000 Motor CAN Libraty calibrated
+//#include "nma2000_motor.h"
+//#include "motor_estimated.h"  // NMA2000 Motor CAN Libraty calibrated
 #include "gvi_motor.h"
 #include "dht_lv_batt.h"
 #include "driver/twai.h"
@@ -56,15 +57,20 @@ static const char *LOG_TAG = "DASH";
 
 // macros used in the drawings
 #define PI              3.14159265f
-#define MAX_POWER_KW    30f
-#define MAX_RPM         4000.0f
-#define MAX_SPD         50.0f
-#define BAT_TEMP_WARN   
+#define MAX_POWER_KW    25.0f
+#define MAX_RPM         4500.0f
+#define MAX_SPD         20.0f
+#define BAT_TEMP_WARN   54
 #define BAT_TEMP_ERROR  60
 #define HUM_WARN        75
 
 #define CX  400
 #define CY  220
+
+#define ID_REVERSE (0x112u)
+
+#define LV_SOC_CAN_ID   0x332U
+#define LV_TEMP_CAN_ID  0x333U
 
 
 //---- Data Structure for the queues ----------------------
@@ -106,6 +112,12 @@ typedef struct {
     char     lines[MQTT_MSG_MAX_ROWS][MQTT_MSG_MAX_LEN];
     uint8_t  count;
 } mqtt_messages_t;
+
+typedef struct{
+    bool enabled, tripped, reverse;
+} status_t;
+static status_t status = {.enabled = false, .tripped = false, .reverse = false};
+static SemaphoreHandle_t status_m;        //mutex
 
 //----- Code Start --------------------------------------------------
 
@@ -309,7 +321,71 @@ void wifi_init_sta(void)
 
     //printf("Wi-Fi started, conntection to SSID: %s\n", WIFI_SSID);
 }
+// ------ Enabled/Disabled visual ----------------------------
+static void draw_motor_state(bool enabled, bool tripped)
+{
+    const int16_t BX = 248;   // angolo alto-sx dell'area gauge
+    const int16_t BY = 58;
+    const int16_t R  = 22;    // mezzo lato del box
 
+    uint32_t col = (enabled && !tripped) ? 0x00CC00UL : 0xFF2200UL;
+    const char *letter = (enabled && !tripped) ? "E" : "D";
+
+    // sfondo box
+    EVE_color_rgb_burst(0x111111UL);
+    EVE_begin_burst(EVE_RECTS);
+    EVE_vertex2f_burst((BX - R) * 16, (BY - R) * 16);
+    EVE_vertex2f_burst((BX + R) * 16, (BY + R) * 16);
+    EVE_end_burst();
+
+    // bordo colorato (dà più risalto)
+    EVE_color_rgb_burst(col);
+    EVE_line_width_burst(2 * 16);
+    EVE_begin_burst(EVE_LINE_STRIP);
+    EVE_vertex2f_burst((BX - R) * 16, (BY - R) * 16);
+    EVE_vertex2f_burst((BX + R) * 16, (BY - R) * 16);
+    EVE_vertex2f_burst((BX + R) * 16, (BY + R) * 16);
+    EVE_vertex2f_burst((BX - R) * 16, (BY + R) * 16);
+    EVE_vertex2f_burst((BX - R) * 16, (BY - R) * 16);
+    EVE_end_burst();
+
+    // lettera grande centrata
+    EVE_color_rgb_burst(col);
+    EVE_cmd_text_burst(BX, BY, 31, EVE_OPT_CENTER, letter);
+}
+
+// ------ Reverse -------------------
+static void draw_motor_reverse(bool reverse)
+{
+    const int16_t BX = 550;   // angolo alto-dx dell'area gauge
+    const int16_t BY = 58;
+    const int16_t R  = 22;    // mezzo lato del box
+
+    uint32_t col = (!reverse) ? 0x00CC00UL : 0xFF2200UL;
+    const char *letter = (reverse) ? "R" : "F";
+
+    // sfondo box
+    EVE_color_rgb_burst(0x111111UL);
+    EVE_begin_burst(EVE_RECTS);
+    EVE_vertex2f_burst((BX - R) * 16, (BY - R) * 16);
+    EVE_vertex2f_burst((BX + R) * 16, (BY + R) * 16);
+    EVE_end_burst();
+
+    // bordo colorato (dà più risalto)
+    EVE_color_rgb_burst(col);
+    EVE_line_width_burst(2 * 16);
+    EVE_begin_burst(EVE_LINE_STRIP);
+    EVE_vertex2f_burst((BX - R) * 16, (BY - R) * 16);
+    EVE_vertex2f_burst((BX + R) * 16, (BY - R) * 16);
+    EVE_vertex2f_burst((BX + R) * 16, (BY + R) * 16);
+    EVE_vertex2f_burst((BX - R) * 16, (BY + R) * 16);
+    EVE_vertex2f_burst((BX - R) * 16, (BY - R) * 16);
+    EVE_end_burst();
+
+    // lettera grande centrata
+    EVE_color_rgb_burst(col);
+    EVE_cmd_text_burst(BX, BY, 31, EVE_OPT_CENTER, letter);
+}
 //------ WIfi and MQTT status symbols on the screen ------------------
 
 static void draw_connectivity_status(bool wifi_ok, bool mqtt_ok)
@@ -582,8 +658,9 @@ static void draw_speed(float speed_kn, const char * title, const char * label)
 
     EVE_color_rgb_burst(0x555555UL);//grey
     EVE_cmd_text_burst(685, 52, 25, EVE_OPT_CENTER, title);
-
-    EVE_color_rgb_burst(0xFFFFFFUL); // white
+    //EVE_color_rgb_burst(0xFFFFFFUL); // white
+    uint32_t spd_col = (speed_kn >= 3.0f) ? 0xFF2200UL : 0xFFFFFFUL;
+    EVE_color_rgb_burst(spd_col);
     char spd[8];
     snprintf(spd, sizeof(spd), "%.1f", (double)speed_kn);
     EVE_cmd_text_burst(685, 114, 1, EVE_OPT_CENTER, spd);
@@ -802,7 +879,7 @@ static void draw_mqtt_bar(const mqtt_messages_t *msgs)
     }
 }
 // ------ Fake MQTT ----------
-static void fake_mqtt_task(void *pvParameters)
+/*static void fake_mqtt_task(void *pvParameters)
 {
     // range value that change every 10 sec 
     const float ranges[][2] = {
@@ -861,12 +938,12 @@ static void fake_mqtt_task(void *pvParameters)
 
         vTaskDelay(pdMS_TO_TICKS(10000)); // 10 secondi
     }
-}
+}*/
 
 
 // ------ Fake Can Task -------------------------------------------
 
-static void fake_can_task(void *pvParameters)
+/*static void fake_can_task(void *pvParameters)
 {
     motor_data_t   motor  = {0};
     battery_pack_t pack   = {0};
@@ -905,7 +982,7 @@ static void fake_can_task(void *pvParameters)
 
         vTaskDelay(pdMS_TO_TICKS(80));
     }
-}
+}*/
 
 // -------- Button Task ---------------------------------------------------
 typedef struct {
@@ -947,9 +1024,9 @@ static void button_task(void *pvParameters)
         }
 
         // bottone cruise: alla premuta, manda il frame
-        if (cruise_prev == true && cruise == false) {
-            send_cruise_cmd(true, CRUISE_RPM);
-        }
+        //if (cruise_prev == true && cruise == false) {
+        //    send_cruise_cmd(true, CRUISE_RPM);
+        //}
 
         btn_prev    = btn;
         cruise_prev = cruise;
@@ -963,8 +1040,9 @@ void can_receiver_task(void *pvParameters)
     esp_task_wdt_add(NULL);
     twai_message_t rxMessage;
     while (1) {
+        int n = 0;
         //ESP_LOGI("CAN", "while 1");
-        while (twai_receive(&rxMessage, pdMS_TO_TICKS(10)) == ESP_OK) {
+        while (n++ < 32 && twai_receive(&rxMessage, 0) == ESP_OK) {
             //ESP_LOGI("CAN", "while twai receive");
             switch (rxMessage.identifier) {
 
@@ -972,18 +1050,41 @@ void can_receiver_task(void *pvParameters)
                     struct gvi_motor_gvi_status_tx_pdo1_t m;
                     if (gvi_motor_gvi_status_tx_pdo1_unpack(&m, rxMessage.data, rxMessage.data_length_code) == 0) {
                         
+                        xSemaphoreTake(status_m, portMAX_DELAY);
+                        status.enabled = m.status_all & (1 << 2);
+                        status.tripped = m.status_all & (1 << 3);
+                        xSemaphoreGive(status_m);
                         motor_data_t motor;
                         if (xQueuePeek(q_motor, &motor, 0) != pdTRUE) {
                             memset(&motor, 0, sizeof(motor));
                         }
-
-                        motor.rpm = (uint16_t)gvi_motor_gvi_status_tx_pdo1_rotor_speed_in_rpm_decode(m.rotor_speed_in_rpm);
+                        int32_t rpm_signed = (int32_t)gvi_motor_gvi_status_tx_pdo1_rotor_speed_in_rpm_decode(m.rotor_speed_in_rpm);
+                        if (rpm_signed < 0) {
+                            rpm_signed = -rpm_signed;     // ora il valore assoluto ha senso
+                        }
+                        motor.rpm = (uint16_t)rpm_signed;
                         motor.voltagedc = (int16_t)gvi_motor_gvi_status_tx_pdo1_signal_f_iltered_voltage_decode(m.signal_f_iltered_voltage);
 
                         xQueueOverwrite(q_motor, &motor);
                     }
                     break;
                 }
+
+                case ID_REVERSE: {  // reverse info
+                    
+                    xSemaphoreTake(status_m, portMAX_DELAY);
+                    status.reverse  = rxMessage.data[0] & (1 << 4);
+                    xSemaphoreGive(status_m);
+                    // struct gvi_motor_commands1_rx_pdo1_t m;
+                    // if (gvi_motor_commands1_rx_pdo1_unpack(&m, rxMessage.data, rxMessage.data_length_code) == 0) {
+                        
+                    //     xSemaphoreTake(status_m, portMAX_DELAY);
+                    //     status.reverse  = m.commands_all & (1U << 4);
+                    //     xSemaphoreGive(status_m);
+                    // }
+                    break;
+                }
+
 
                 case GVI_MOTOR_DIAGNOSTIC1_TX_PDO2_FRAME_ID: {  // 0x286
                     struct gvi_motor_diagnostic1_tx_pdo2_t m;
@@ -1025,7 +1126,7 @@ void can_receiver_task(void *pvParameters)
                     if (xQueuePeek(q_motor, &motor, 0) != pdTRUE) {
                         memset(&motor, 0, sizeof(motor));
                     }
-                    motor.speed_kn = batteries_gps_motor_2_gnss_speed_speed_decode(msg.speed);
+                    motor.speed_kn = 1.94*batteries_gps_motor_2_gnss_speed_speed_decode(msg.speed);
                     xQueueOverwrite(q_motor, &motor);
                     break;
                 }
@@ -1069,7 +1170,7 @@ void can_receiver_task(void *pvParameters)
                         if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
                             memset(&pack, 0, sizeof(pack));
                         }
-                        pack.bat[0].temp_c = batteries_temperature_1_max_t_1_decode(m.max_t_1);
+                        pack.bat[0].temp_c = (uint8_t)batteries_temperature_1_max_t_1_decode(m.max_t_1);
                         xQueueOverwrite(q_battery, &pack);
                     }
                     break;
@@ -1105,17 +1206,77 @@ void can_receiver_task(void *pvParameters)
                     break;
                 }
 
+                case LV_SOC_CAN_ID: {
+                    if (rxMessage.data_length_code != 2) {
+                        //ESP_LOGW(
+                            //"LV_BATT",
+                            //"Invalid LV voltage DLC: %u",
+                            //rxMessage.data_length_code
+                        //);
+                        break;
+                    }
 
+                    uint16_t batt_mv =
+                        (uint16_t)rxMessage.data[0] |
+                        ((uint16_t)rxMessage.data[1] << 8);
+
+                    
+                    //ESP_LOGI(
+                        //"LV_BATT",
+                        //"LV battery voltage: %u mV",
+                        //batt_mv
+                    //);
+                    battery_pack_t pack;
+                    if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
+                        memset(&pack, 0, sizeof(pack));
+                    }
+                    float volt = (float)(batt_mv/1000.0);
+                    uint8_t soc = (uint8_t)(100*volt/16);
+                    if (soc > 100) soc = 100;
+                    pack.bat[2].soc = soc;
+                    pack.bat[2].voltage = volt;
+                    xQueueOverwrite(q_battery, &pack);
+                    break;
+                }
+
+                case LV_TEMP_CAN_ID: {
+                    if (rxMessage.data_length_code != 2) {
+                        ESP_LOGW(
+                            "LV_BATT",
+                            "Invalid LV temperature DLC: %u",
+                            rxMessage.data_length_code
+                        );
+                        break;
+                    }
+
+                    uint16_t raw =
+                        (uint16_t)rxMessage.data[0] |
+                        ((uint16_t)rxMessage.data[1] << 8);
+
+                    int16_t temp_decic = (int16_t)raw;
+                    float temp_c = (float)temp_decic / 10.0f;
+
+                    battery_pack_t pack;
+                    if (xQueuePeek(q_battery, &pack, 0) != pdTRUE) {
+                        memset(&pack, 0, sizeof(pack));
+                    }
+
+                    pack.bat[2].temp_c = (uint8_t)(temp_c);
+                    xQueueOverwrite(q_battery, &pack);
+
+                    break;
+                }
 
                 default:
                 //ESP_LOGI("CAN", "id=0x%08lX extd=%d dlc=%d",
              //(unsigned long)rxMessage.identifier,
              //rxMessage.extd, rxMessage.data_length_code);
-                    break;
+                break;
+
             }
         }
         esp_task_wdt_reset();
-        vTaskDelay(pdMS_TO_TICKS(2)); 
+        vTaskDelay(1); 
     }
 }
 
@@ -1136,7 +1297,7 @@ static void eve_task(void *pvParameters)
     ESP_LOGI(LOG_TAG, "FT812 ok");
 
     EVE_memWrite16(REG_PWM_HZ,   1000U);
-    EVE_memWrite8(REG_PWM_DUTY,  96U);
+    EVE_memWrite8(REG_PWM_DUTY,  128U);
 
     motor_data_t    motor    = {0};
     battery_pack_t  pack     = {0};
@@ -1155,7 +1316,13 @@ static void eve_task(void *pvParameters)
         xQueuePeek(q_sensor,        &sensor, 0);
         xQueuePeek(q_power_window,  &pw,     0);
         motor.power_kw = motor.currentdc * motor.voltagedc / 1000.0f;
+        bool en, tr, re;
+        xSemaphoreTake(status_m, portMAX_DELAY);
+        en = status.enabled;
+        tr = status.tripped;
+        re = status.reverse;
 
+        xSemaphoreGive(status_m);
         mqtt_messages_t new_msgs;
         if (xQueuePeek(q_mqtt_msgs, &new_msgs, 0) == pdTRUE) {
             msgs = new_msgs;
@@ -1187,6 +1354,8 @@ static void eve_task(void *pvParameters)
         draw_batteries(&pack);
         draw_mqtt_bar(&msgs);
         draw_connectivity_status(wifi_connected, mqtt_connected);
+        draw_motor_state(en, tr);
+        draw_motor_reverse(re);
 
         EVE_display_burst();
         EVE_cmd_swap_burst();
@@ -1196,7 +1365,7 @@ static void eve_task(void *pvParameters)
         //ESP_LOGI(LOG_TAG, "frame: %lld us", t1 - t0);
         esp_task_wdt_reset();
 
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(70));
     }
 }
 
@@ -1230,6 +1399,8 @@ void app_main(void)
     sensor_data_t  s = {0};   xQueueSend(q_sensor,       &s, 0);
     power_window_t p = {0};   xQueueSend(q_power_window, &p, 0);
 
+    status_m = xSemaphoreCreateMutex();
+
 
     // wifi and mqtt initialization
     wifi_init_sta(); // connection to wifi
@@ -1239,7 +1410,7 @@ void app_main(void)
 
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX, CAN_RX, TWAI_MODE_LISTEN_ONLY); 
     g_config.tx_queue_len = 20;
-    g_config.rx_queue_len = 30;
+    g_config.rx_queue_len = 64;
     twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
     twai_timing_config_t t_config = TWAI_TIMING_CONFIG_250KBITS();  
  
