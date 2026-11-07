@@ -9,7 +9,7 @@ idf_component_register(
        
         "batteries.c"
     INCLUDE_DIRS "."
-    REQUIRES EVE esp_timer nvs_flash esp_wifi esp_event esp_netif mqtt json driver
+    REQUIRES EVE esp_timer nvs_flash esp_wifi esp_event esp_netif mqtt cjson esp_driver_spi esp_driver_gpio driver
 )
 
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
